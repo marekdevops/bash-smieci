@@ -1,6 +1,16 @@
 #!/bin/bash
 set -eo pipefail
 
+# Konfiguracja blokady
+LOCK_FILE="/tmp/${SCRIPT_NAME}.lock"
+
+# Blokada plikowa z timeout 0 (natychmiastowe wyjście jeśli zablokowane)
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+    echo "Inna instancja skryptu już działa. Wyjście." >&2
+    exit 1
+fi
+
 # Konfiguracja
 SCRIPT_NAME=$(basename "$0" .sh)
 LOG_FILE="${SCRIPT_NAME}.out"
@@ -15,11 +25,18 @@ FTP_REMOTE_DIR="/remote/logs"
 FTP_PARALLEL=5
 
 # Konfiguracja katalogów
-search_dir=""  # Ustaw ścieżkę do wyszukiwania plików (pozostaw puste, aby użyć pełnego mirrora)
+search_dir=""  # Ustaw ścieżkę do wyszukiwania plików (pozostaw puste aby użyć pełnego mirrora)
 local_mirror_dir="/ścieżka/do/lokalnego/katalogu"
 
 # Przekierowanie wyjść do logu
-exec > >(tee -a "${LOG_FILE}") 2>&1
+exec >> "${LOG_FILE}" 2>&1
+
+# Nagłówek logu
+echo "=============================================="
+echo "Start skryptu: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "PID procesu: $$"
+echo "Tymczasowy katalog: ${TMP_LOGS_DIR}"
+echo "=============================================="
 
 # Funkcja czyszcząca
 cleanup() {
@@ -29,8 +46,8 @@ cleanup() {
         echo "Katalog tymczasowy usunięty: ${TMP_LOGS_DIR}"
     else
         echo "Katalog tymczasowy pozostawiony: ${TMP_LOGS_DIR}"
-        echo "Sprawdź zawartość katalogu, aby zdiagnozować problem."
     fi
+    # Zwolnienie blokady automatycznie przez flock
 }
 
 # Funkcja do wyszukiwania plików
@@ -70,11 +87,6 @@ trap cleanup EXIT TERM INT
 
 # Główna logika skryptu
 main() {
-    echo "=============================================="
-    echo "Start skryptu: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "Tymczasowy katalog: ${TMP_LOGS_DIR}"
-    echo "=============================================="
-
     if [ -n "${search_dir}" ]; then
         # Tryb wyszukiwania i kopiowania
         echo "Wyszukiwanie plików w katalogu: ${search_dir}"
@@ -88,10 +100,10 @@ main() {
         fi
 
         echo "Znalezione pliki:"
-        echo "${RECENT_FILES}" | tee -a "${LOG_FILE}"
+        echo "${RECENT_FILES}"
 
         echo "Kopiowanie plików do: ${TMP_LOGS_DIR}"
-        cp -v --preserve=all ${RECENT_FILES} "${TMP_LOGS_DIR}" | tee -a "${LOG_FILE}"
+        cp -v --preserve=all ${RECENT_FILES} "${TMP_LOGS_DIR}"
         send_to_ftp "${TMP_LOGS_DIR}" "${FTP_REMOTE_DIR}"
     else
         # Tryb pełnego mirrora
