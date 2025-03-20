@@ -50,6 +50,23 @@ cleanup() {
     # Zwolnienie blokady automatycznie przez flock
 }
 
+# NEW: Funkcja kompresji plików
+compress_uncompressed_files() {
+    local work_dir="$1"
+    
+    echo "Sprawdzanie i kompresowanie plików w: ${work_dir}"
+    
+    find "${work_dir}" -type f -not -name "*.gz" -print0 | while IFS= read -r -d $'\0' file; do
+        file_type=$(file -b "$file")
+        if ! echo "$file_type" | grep -q "gzip compressed"; then
+            echo "Kompresowanie pliku: ${file}"
+            gzip -9 "${file}"
+        fi
+    done
+    
+    echo "Kompresja zakończona"
+}
+
 # Funkcja do wyszukiwania plików
 find_recent_files() {
     local search_dir="$1"
@@ -104,6 +121,10 @@ main() {
 
         echo "Kopiowanie plików do: ${TMP_LOGS_DIR}"
         cp -v --preserve=all ${RECENT_FILES} "${TMP_LOGS_DIR}"
+        
+        # NEW: Wywołanie funkcji kompresji przed wysyłką
+        compress_uncompressed_files "${TMP_LOGS_DIR}"
+        
         send_to_ftp "${TMP_LOGS_DIR}" "${FTP_REMOTE_DIR}"
     else
         # Tryb pełnego mirrora
