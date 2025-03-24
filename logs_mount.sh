@@ -111,6 +111,33 @@ mount_logsfilesystem() {
     exit 1
 }
 
+umount_filesystem() {
+    if mountpoint -q "${search_dir}"; then
+        echo "Bezpieczne odmontowywanie NFS z ${search_dir}"
+        
+        # Próba normalnego odmontowania
+        if umount "${search_dir}"; then
+            echo "NFS odmontowany pomyślnie"
+            FILESYSTEM_MOUNTED=false
+            return 0
+        fi
+
+        # Próba wymuszonego odmontowania po błędzie
+        echo "Próba wymuszonego odmontowania..."
+        if umount -f -l "${search_dir}"; then
+            echo "NFS odmontowany z użyciem opcji wymuszającej"
+            FILESYSTEM_MOUNTED=false
+            return 0
+        fi
+
+        echo "Krytyczny błąd odmontowywania NFS!" >&2
+        return 1
+    else
+        echo "NFS nie był zamontowany, pomijanie odmontowania"
+        return 0
+    fi
+}
+
 # Funkcja kompresji plików
 compress_uncompressed_files() {
     local work_dir="$1"
