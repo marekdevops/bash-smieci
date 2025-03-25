@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# Tworzymy tymczasowy plik crontab
+temp_crontab=$(mktemp)
+
+# Inicjalizujemy zmienne czasu
+hour=5
+minute=0
+
+# Iterujemy przez wszystkie pliki .sh w bieżącym katalogu
+for script in *.sh; do
+    # Dodajemy wpis do crontab
+    echo "$minute $hour * * * $(pwd)/$script" >> "$temp_crontab"
+    
+    # Zwiększamy minuty o 15
+    minute=$((minute + 15))
+    
+    # Jeśli minuty przekroczą 59, zwiększamy godzinę
+    if [ $minute -ge 60 ]; then
+        minute=$((minute - 60))
+        hour=$((hour + 1))
+    fi
+    
+    # Jeśli godzina przekroczy 23, wracamy do 0
+    if [ $hour -ge 24 ]; then
+        hour=$((hour - 24))
+    fi
+done
