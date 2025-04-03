@@ -64,8 +64,16 @@ copy_host_logs() {
 
         echo "Łączenie z hostem: ${host}, katalog: ${remote_dir}"
 
-        # Wyszukiwanie plików starszych niż 1 dzień na hoście zdalnym i kopiowanie ich do katalogu tymczasowego
-        ssh "${host}" "find ${remote_dir} -type f -mtime +1" | while read -r file; do
+        # Wyszukiwanie plików starszych niż 1 dzień na hoście zdalnym
+        files=$(ssh "${host}" "find ${remote_dir} -type f -mtime +1")
+        
+        if [ -z "$files" ]; then
+            echo "Brak plików do skopiowania na hoście ${host}."
+            continue
+        fi
+
+        # Kopiowanie każdego pliku do katalogu tymczasowego
+        for file in $files; do
             echo "Kopiowanie pliku: ${file} z hosta ${host} do ${tmp_dir}"
             scp "${host}:${file}" "${tmp_dir}/" || {
                 echo "Błąd podczas kopiowania pliku ${file} z hosta ${host}" >&2
@@ -76,6 +84,7 @@ copy_host_logs() {
 
     echo "Kopiowanie logów z hostów zakończone."
 }
+
 
 # Funkcja przesyłająca pliki (obsługa FTP i SFTP)
 send_to_server() {
