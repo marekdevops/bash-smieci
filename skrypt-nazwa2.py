@@ -2,7 +2,7 @@
 import sys
 import itertools
 
-SROD = ['ts', 't1', 't2', 't3', 'dv', 'pp', 'sr']
+SROD = ['ts', 't1', 't2', 't3', 'dv', 'pp', 'sr', 'pr']
 TYP = ['ap', 'db', 'fl']
 SYSOP = ['l', 'w', 'a', 'o']
 
@@ -20,7 +20,7 @@ def main():
 
     for s, t, z in itertools.product(srod, typ, sysop):
         stala_czesc = f"{s}-{t}-{z}-"
-        max_dlugosc_app = 12 - len(stala_czesc)
+        max_dlugosc_app = 13 - len(stala_czesc)
         app_part = app[:max_dlugosc_app].ljust(max_dlugosc_app, '_')
         nazwa = f"{stala_czesc}{app_part}"
         print(nazwa)
