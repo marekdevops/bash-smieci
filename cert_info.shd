@@ -36,6 +36,7 @@ show_help() {
     echo "  $0 example.com /etc/ssl/certs/ca-bundle.crt"
     echo "  $0 -d 60 mysite.com ./certificates.pem"
     echo "  $0 -v google.com /path/to/bundle.pem"
+    echo "  $0 --debug github.com /etc/ssl/certs/ca-bundle.crt"
 }
 
 # Domyślne wartości
@@ -362,6 +363,7 @@ else
     echo "   • Sprawdź czy nazwa jest poprawna"
     echo "   • Spróbuj użyć części nazwy (np. 'example' zamiast 'www.example.com')"
     echo "   • Sprawdź czy plik bundla zawiera certyfikaty w formacie PEM"
+    echo "   • Użyj opcji --debug aby zobaczyć wszystkie przetwarzane certyfikaty"
 fi
 
 echo ""
