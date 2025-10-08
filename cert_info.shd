@@ -179,6 +179,16 @@ expired_count=0
 expiring_soon_count=0
 
 echo "🔎 Przeszukiwanie bundla... (znaleziono $cert_counter certyfikatów)"
+
+# Debug - pokaż ile plików certyfikatów zostało utworzonych
+if [ "$DEBUG" = true ]; then
+    actual_files=$(ls -1 "$TEMP_DIR"/cert_*.pem 2>/dev/null | wc -l)
+    echo "📁 DEBUG: Utworzono $actual_files plików certyfikatów w $TEMP_DIR"
+    if [ "$actual_files" -ne "$cert_counter" ]; then
+        echo "⚠️  UWAGA: Liczba plików ($actual_files) nie zgadza się z liczbą certyfikatów ($cert_counter)"
+    fi
+fi
+
 echo ""
 
 # Funkcja do sprawdzania czy certyfikat pasuje do szukanej nazwy
@@ -190,44 +200,10 @@ cert_matches_name() {
     local cert_text=$(openssl x509 -in "$cert_file" -text -noout 2>/dev/null)
     [ $? -ne 0 ] && return 1
     
-    [ "$DEBUG" = true ] && echo "   🔍 Szukam: '$search_name'"
-    
-    # 1. Najprostsze sprawdzenie - czy nazwa występuje gdziekolwiek
+    # Proste wyszukiwanie - jak w pierwotnej wersji
     if echo "$cert_text" | grep -qi "$search_name"; then
         [ "$DEBUG" = true ] && echo "   ✓ Znaleziono '$search_name' w certyfikacie"
         return 0
-    fi
-    
-    # 2. Sprawdź z różnymi prefiksami/sufiksami dla domeny
-    local domain_patterns=(
-        "\\.$search_name"           # .example.com
-        "$search_name\\."           # example.com.
-        "\\*\\.$search_name"        # *.example.com
-        "CN=.*$search_name"         # CN=coś z example.com
-        "DNS:.*$search_name"        # DNS:coś z example.com
-    )
-    
-    for pattern in "${domain_patterns[@]}"; do
-        if echo "$cert_text" | grep -qi "$pattern"; then
-            [ "$DEBUG" = true ] && echo "   ✓ Znaleziono wzorzec: $pattern"
-            return 0
-        fi
-    done
-    
-    # 3. Sprawdź czy to może być część większej nazwy domeny
-    # Np. szukamy "google" a w certyfikacie jest "www.google.com"
-    if echo "$cert_text" | grep -i "CN=" | grep -qi "[a-zA-Z0-9.-]*$search_name[a-zA-Z0-9.-]*"; then
-        [ "$DEBUG" = true ] && echo "   ✓ Znaleziono '$search_name' jako część domeny w CN"
-        return 0
-    fi
-    
-    # 4. Sprawdź w SAN (Subject Alternative Names)
-    local san_section=$(echo "$cert_text" | grep -A 10 "Subject Alternative Name:" | grep "DNS:")
-    if [ ! -z "$san_section" ]; then
-        if echo "$san_section" | grep -qi "$search_name"; then
-            [ "$DEBUG" = true ] && echo "   ✓ Znaleziono '$search_name' w SAN"
-            return 0
-        fi
     fi
     
     [ "$DEBUG" = true ] && echo "   ✗ Nie znaleziono: '$search_name'"
@@ -238,27 +214,16 @@ cert_matches_name() {
 for cert_file in "$TEMP_DIR"/cert_*.pem; do
     [ -f "$cert_file" ] || continue
     
+    # Sprawdź czy plik certyfikatu jest poprawny
+    if ! openssl x509 -in "$cert_file" -noout 2>/dev/null; then
+        [ "$DEBUG" = true ] && echo "❌ DEBUG: Uszkodzony certyfikat: $(basename "$cert_file")"
+        continue
+    fi
+    
     # Debug - pokaż informacje o każdym certyfikacie
     if [ "$DEBUG" = true ]; then
         cert_subject=$(openssl x509 -in "$cert_file" -subject -noout 2>/dev/null | sed 's/subject=//')
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo "🔍 DEBUG: Certyfikat #$(basename "$cert_file" .pem | sed 's/cert_//')"
-        echo "   Subject: $cert_subject"
-        
-        # Pokaż wszystkie DNS nazwy z SAN
-        san_dns=$(openssl x509 -in "$cert_file" -text -noout 2>/dev/null | grep -A 20 "Subject Alternative Name:" | grep "DNS:" | sed 's/.*DNS://g' | tr ',' '\n' | sed 's/^[ \t]*//' | grep -v "^$")
-        if [ ! -z "$san_dns" ]; then
-            echo "   DNS w SAN:"
-            echo "$san_dns" | while read -r dns_name; do
-                [ ! -z "$dns_name" ] && echo "     • $dns_name"
-            done
-        fi
-        
-        # Wyciągnij CN z Subject
-        cn_name=$(echo "$cert_subject" | grep -o "CN=[^,]*" | sed 's/CN=//' | head -n1)
-        if [ ! -z "$cn_name" ]; then
-            echo "   CN: $cn_name"
-        fi
+        echo "🔍 DEBUG: Certyfikat #$(basename "$cert_file" .pem | sed 's/cert_//'): $cert_subject"
     fi
     
     # Sprawdzenie czy certyfikat zawiera szukaną nazwę
