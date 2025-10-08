@@ -291,8 +291,6 @@ for cert_file in "${cert_files[@]}"; do
     fi
 done
 
-done
-
 # Podsumowanie
 echo ""
 echo "📊 PODSUMOWANIE"
