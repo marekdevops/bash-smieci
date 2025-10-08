@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# Script: cert_info.sh
-# Description: Wyciąga certyfikaty z bundla i wyświetla informacje o nich
+# Script: cert_info.shd
+# Description: Wyciąga certyfikaty z bundla i wyświetla informacje o nich (uproszczona wersja)
 # Author: Marek
 # Date: $(date +%Y-%m-%d)
 # System: Red Hat Enterprise Linux / CentOS / Fedora
@@ -11,7 +11,7 @@
 if ! command -v openssl &> /dev/null; then
     echo "BŁĄD: openssl nie jest zainstalowane. Zainstaluj używając:"
     echo "sudo yum install openssl"
-    echo "lub"
+    echo "lub"  
     echo "sudo dnf install openssl"
     exit 1
 fi
@@ -30,13 +30,12 @@ show_help() {
     echo "  -h, --help         Wyświetl tę pomoc"
     echo "  -v, --verbose      Tryb szczegółowy"
     echo "  -d, --days LICZBA  Sprawdź certyfikaty wygasające w ciągu podanych dni (domyślnie: 30)"
-    echo "  --debug            Tryb debugowania (pokazuje wszystkie przetwarzane certyfikaty)"
+    echo "  --debug            Tryb debugowania"
     echo ""
     echo "Przykłady:"
-    echo "  $0 example.com /etc/ssl/certs/ca-bundle.crt"
-    echo "  $0 -d 60 mysite.com ./certificates.pem"
-    echo "  $0 -v google.com /path/to/bundle.pem"
-    echo "  $0 --debug github.com /etc/ssl/certs/ca-bundle.crt"
+    echo "  $0 bko /etc/ssl/certs/ca-bundle.crt"
+    echo "  $0 -d 60 google ./certificates.pem"
+    echo "  $0 --debug example /path/to/bundle.pem"
 }
 
 # Domyślne wartości
@@ -152,204 +151,177 @@ echo ""
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
-# Lepszy podział bundla na pojedyncze certyfikaty
-cert_counter=0
-current_cert=""
-in_cert=false
+echo "🔎 Rozdzielanie certyfikatów z bundla..."
 
-while IFS= read -r line; do
-    if [[ "$line" == "-----BEGIN CERTIFICATE-----" ]]; then
-        in_cert=true
-        cert_counter=$((cert_counter + 1))
-        current_cert="$TEMP_DIR/cert_$cert_counter.pem"
-        echo "$line" > "$current_cert"
-    elif [[ "$line" == "-----END CERTIFICATE-----" ]]; then
-        if [[ "$in_cert" == true ]]; then
-            echo "$line" >> "$current_cert"
-            in_cert=false
-        fi
-    elif [[ "$in_cert" == true ]]; then
-        echo "$line" >> "$current_cert"
-    fi
-done < "$BUNDLE_FILE"
+# Użyj prostej metody AWK do podziału bundla - sprawdzona i niezawodna
+awk '
+BEGIN { cert_num = 0 }
+/-----BEGIN CERTIFICATE-----/ {
+    cert_num++
+    filename = "'$TEMP_DIR'/cert_" cert_num ".pem"
+    print $0 > filename
+    in_cert = 1
+    next
+}
+/-----END CERTIFICATE-----/ {
+    if (in_cert) {
+        print $0 >> filename
+        close(filename)
+        in_cert = 0
+    }
+    next
+}
+in_cert {
+    print $0 >> filename
+}
+END { print "Podzielono na " cert_num " certyfikatów" }
+' "$BUNDLE_FILE"
 
-# Licznik znalezionych certyfikatów
-found_count=0
-expired_count=0
-expiring_soon_count=0
+# Policz ile plików certyfikatów zostało utworzonych
+cert_files=($(ls "$TEMP_DIR"/cert_*.pem 2>/dev/null))
+total_certs=${#cert_files[@]}
 
-echo "🔎 Przeszukiwanie bundla... (znaleziono $cert_counter certyfikatów)"
-
-# Debug - pokaż ile plików certyfikatów zostało utworzonych
-if [ "$DEBUG" = true ]; then
-    actual_files=$(ls -1 "$TEMP_DIR"/cert_*.pem 2>/dev/null | wc -l)
-    echo "📁 DEBUG: Utworzono $actual_files plików certyfikatów w $TEMP_DIR"
-    if [ "$actual_files" -ne "$cert_counter" ]; then
-        echo "⚠️  UWAGA: Liczba plików ($actual_files) nie zgadza się z liczbą certyfikatów ($cert_counter)"
-    fi
-fi
-
+echo "� Utworzono $total_certs plików certyfikatów"
 echo ""
 
-# Funkcja do sprawdzania czy certyfikat pasuje do szukanej nazwy
-cert_matches_name() {
-    local cert_file="$1"
-    local search_name="$2"
-    
-    # Pobierz pełny tekst certyfikatu
-    local cert_text=$(openssl x509 -in "$cert_file" -text -noout 2>/dev/null)
-    [ $? -ne 0 ] && return 1
-    
-    # Proste wyszukiwanie - jak w pierwotnej wersji
-    if echo "$cert_text" | grep -qi "$search_name"; then
-        [ "$DEBUG" = true ] && echo "   ✓ Znaleziono '$search_name' w certyfikacie"
-        return 0
-    fi
-    
-    [ "$DEBUG" = true ] && echo "   ✗ Nie znaleziono: '$search_name'"
-    return 1
-}
+# Liczniki
+found_count=0
+expired_count=0  
+expiring_soon_count=0
 
-# Przeszukiwanie każdego certyfikatu
-for cert_file in "$TEMP_DIR"/cert_*.pem; do
+echo "🔍 Wyszukiwanie certyfikatów zawierających: '$CERT_NAME'"
+echo ""
+
+# Przeszukaj każdy certyfikat
+for cert_file in "${cert_files[@]}"; do
     [ -f "$cert_file" ] || continue
     
-    # Sprawdź czy plik certyfikatu jest poprawny
+    cert_num=$(basename "$cert_file" .pem | sed 's/cert_//')
+    
+    # Sprawdź poprawność certyfikatu
     if ! openssl x509 -in "$cert_file" -noout 2>/dev/null; then
-        [ "$DEBUG" = true ] && echo "❌ DEBUG: Uszkodzony certyfikat: $(basename "$cert_file")"
+        [ "$DEBUG" = true ] && echo "❌ Certyfikat $cert_num: uszkodzony, pomijam"
         continue
     fi
     
-    # Debug - pokaż informacje o każdym certyfikacie
+    # Pobierz informacje o certyfikacie
+    cert_text=$(openssl x509 -in "$cert_file" -text -noout 2>/dev/null)
+    cert_subject=$(openssl x509 -in "$cert_file" -subject -noout 2>/dev/null | sed 's/subject=//')
+    
+    # Debug info
     if [ "$DEBUG" = true ]; then
-        cert_subject=$(openssl x509 -in "$cert_file" -subject -noout 2>/dev/null | sed 's/subject=//')
-        echo "🔍 DEBUG: Certyfikat #$(basename "$cert_file" .pem | sed 's/cert_//'): $cert_subject"
+        echo "🔍 Certyfikat $cert_num: $cert_subject"
+        echo "   Szukam: '$CERT_NAME'"
     fi
     
-    # Sprawdzenie czy certyfikat zawiera szukaną nazwę
-    if cert_matches_name "$cert_file" "$CERT_NAME"; then
+    # PROSTE wyszukiwanie - jeśli nazwa występuje GDZIEKOLWIEK w certyfikacie
+    if echo "$cert_text" | grep -qi "$CERT_NAME"; then
         found_count=$((found_count + 1))
         
-        echo "🎯 ZNALEZIONY CERTYFIKAT #$found_count"
+        [ "$DEBUG" = true ] && echo "   ✅ ZNALEZIONO!"
+        
+        echo "🎯 ZNALEZIONY CERTYFIKAT #$found_count (z pliku cert_$cert_num.pem)"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         
-        # Wyciągnięcie informacji o certyfikacie
-        cert_info=$(openssl x509 -in "$cert_file" -text -noout 2>/dev/null)
+        # Subject (właściciel certyfikatu)
+        subject=$(echo "$cert_text" | grep "Subject:" | sed 's/.*Subject: //')
+        echo "👤 Właściciel: $subject"
         
-        if [ $? -eq 0 ]; then
-            # Subject (właściciel certyfikatu)
-            subject=$(echo "$cert_info" | grep "Subject:" | sed 's/.*Subject: //')
-            echo "👤 Właściciel: $subject"
+        # Issuer (wystawca)  
+        issuer=$(echo "$cert_text" | grep "Issuer:" | sed 's/.*Issuer: //')
+        echo "🏢 Wystawca: $issuer"
+        
+        # Serial Number
+        serial=$(echo "$cert_text" | grep "Serial Number:" | sed 's/.*Serial Number: *//')
+        echo "🔢 Numer seryjny: $serial"
             
-            # Issuer (wystawca)
-            issuer=$(echo "$cert_info" | grep "Issuer:" | sed 's/.*Issuer: //')
-            echo "🏢 Wystawca: $issuer"
-            
-            # Serial Number
-            serial=$(echo "$cert_info" | grep "Serial Number:" | sed 's/.*Serial Number: *//')
-            echo "🔢 Numer seryjny: $serial"
-            
-            # Daty ważności
-            not_before=$(openssl x509 -in "$cert_file" -startdate -noout 2>/dev/null | sed 's/notBefore=//')
-            not_after=$(openssl x509 -in "$cert_file" -enddate -noout 2>/dev/null | sed 's/notAfter=//')
-            
-            echo "📅 Ważny od: $(format_date "$not_before")"
-            echo "📅 Ważny do: $(format_date "$not_after")"
-            
-            # Sprawdzenie statusu wygaśnięcia
-            days_left=$(days_until_expiry "$not_after")
-            
-            if [ "$days_left" != "N/A" ]; then
-                if [ "$days_left" -lt 0 ]; then
-                    expired_count=$((expired_count + 1))
-                    print_colored "red" "⚠️  STATUS: WYGASŁY (od $((-days_left)) dni)"
-                elif [ "$days_left" -le "$DAYS_WARNING" ]; then
-                    expiring_soon_count=$((expiring_soon_count + 1))
-                    print_colored "yellow" "⚠️  STATUS: WYGASA WKRÓTCE (za $days_left dni)"
-                else
-                    print_colored "green" "✅ STATUS: WAŻNY (wygasa za $days_left dni)"
-                fi
+        # Daty ważności
+        not_before=$(openssl x509 -in "$cert_file" -startdate -noout 2>/dev/null | sed 's/notBefore=//')
+        not_after=$(openssl x509 -in "$cert_file" -enddate -noout 2>/dev/null | sed 's/notAfter=//')
+        
+        echo "📅 Ważny od: $(format_date "$not_before")"
+        echo "📅 Ważny do: $(format_date "$not_after")"
+        
+        # Status certyfikatu
+        days_left=$(days_until_expiry "$not_after")
+        
+        if [ "$days_left" != "N/A" ]; then
+            if [ "$days_left" -lt 0 ]; then
+                expired_count=$((expired_count + 1))
+                print_colored "red" "⚠️  STATUS: WYGASŁY (od $((-days_left)) dni)"
+            elif [ "$days_left" -le "$DAYS_WARNING" ]; then
+                expiring_soon_count=$((expiring_soon_count + 1))
+                print_colored "yellow" "⚠️  STATUS: WYGASA WKRÓTCE (za $days_left dni)"
             else
-                print_colored "yellow" "❓ STATUS: Nie można określić"
+                print_colored "green" "✅ STATUS: WAŻNY (wygasa za $days_left dni)"
             fi
-            
-            # Subject Alternative Names (SAN)
-            san=$(echo "$cert_info" | grep -A1 "Subject Alternative Name:" | tail -n1 | sed 's/.*DNS://' | tr ',' '\n' | sed 's/^[ \t]*//' | grep -v "^$")
-            if [ ! -z "$san" ]; then
-                echo "🌐 Alternatywne nazwy:"
-                echo "$san" | while read -r name; do
-                    [ ! -z "$name" ] && echo "   • $name"
-                done
-            fi
-            
-            # Key Usage
-            key_usage=$(echo "$cert_info" | grep -A1 "Key Usage:" | tail -n1 | sed 's/^[ \t]*//')
-            if [ ! -z "$key_usage" ]; then
-                echo "🔑 Użycie klucza: $key_usage"
-            fi
-            
-            # Verbose mode - dodatkowe informacje
-            if [ "$VERBOSE" = true ]; then
-                echo ""
-                echo "📋 SZCZEGÓŁOWE INFORMACJE:"
-                
-                # Algorytm podpisu
-                sig_alg=$(echo "$cert_info" | grep "Signature Algorithm:" | head -n1 | sed 's/.*Signature Algorithm: //')
-                echo "   🔐 Algorytm podpisu: $sig_alg"
-                
-                # Rozmiar klucza
-                key_size=$(echo "$cert_info" | grep "Public-Key:" | sed 's/.*Public-Key: (\([0-9]*\) bit).*/\1/')
-                if [ ! -z "$key_size" ]; then
-                    echo "   🔢 Rozmiar klucza: $key_size bit"
-                fi
-                
-                # Fingerprint
-                fingerprint=$(openssl x509 -in "$cert_file" -fingerprint -sha256 -noout 2>/dev/null | sed 's/SHA256 Fingerprint=//')
-                if [ ! -z "$fingerprint" ]; then
-                    echo "   👆 SHA256 Fingerprint: $fingerprint"
-                fi
-            fi
-            
         else
-            print_colored "red" "❌ Błąd podczas przetwarzania certyfikatu"
+            print_colored "yellow" "❓ STATUS: Nie można określić"
+        fi
+        
+        # Subject Alternative Names (SAN)
+        san=$(echo "$cert_text" | grep -A5 "Subject Alternative Name:" | grep "DNS:" | sed 's/.*DNS://g' | tr ',' '\n' | sed 's/^[ \t]*//' | head -10)
+        if [ ! -z "$san" ]; then
+            echo "🌐 Alternatywne nazwy:"
+            echo "$san" | while read -r name; do
+                [ ! -z "$name" ] && echo "   • $name"
+            done
+        fi
+        
+        # Verbose mode
+        if [ "$VERBOSE" = true ]; then
+            echo ""
+            echo "📋 SZCZEGÓŁOWE INFORMACJE:"
+            
+            # Algorytm podpisu
+            sig_alg=$(echo "$cert_text" | grep "Signature Algorithm:" | head -n1 | sed 's/.*Signature Algorithm: //')
+            echo "   🔐 Algorytm podpisu: $sig_alg"
+            
+            # Fingerprint
+            fingerprint=$(openssl x509 -in "$cert_file" -fingerprint -sha256 -noout 2>/dev/null | sed 's/SHA256 Fingerprint=//')
+            [ ! -z "$fingerprint" ] && echo "   👆 SHA256: $fingerprint"
         fi
         
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo ""
+        
+    else
+        [ "$DEBUG" = true ] && echo "   ❌ Nie zawiera '$CERT_NAME'"
     fi
 done
 
+done
+
 # Podsumowanie
+echo ""
 echo "📊 PODSUMOWANIE"
 echo "==============="
-echo "🔍 Wyszukiwane: $CERT_NAME"
-echo "🔢 Przetworzonych certyfikatów: $cert_counter"
-echo "📁 Przeszukany bundle: $BUNDLE_FILE"
-echo "🎯 Znalezione certyfikaty: $found_count"
+echo "🔍 Wyszukiwane: '$CERT_NAME'"
+echo "🔢 Przetworzonych certyfikatów: $total_certs"
+echo "📁 Bundle: $BUNDLE_FILE"
+echo "🎯 Znaleziono: $found_count certyfikat(y/ów)"
 
 if [ "$found_count" -gt 0 ]; then
     if [ "$expired_count" -gt 0 ]; then
-        print_colored "red" "❌ Wygasłe certyfikaty: $expired_count"
+        print_colored "red" "❌ Wygasłe: $expired_count"
     fi
-    
     if [ "$expiring_soon_count" -gt 0 ]; then
-        print_colored "yellow" "⚠️  Wygasające wkrótce (≤ $DAYS_WARNING dni): $expiring_soon_count"
+        print_colored "yellow" "⚠️  Wygasające wkrótce (≤$DAYS_WARNING dni): $expiring_soon_count"
     fi
     
     valid_count=$((found_count - expired_count - expiring_soon_count))
     if [ "$valid_count" -gt 0 ]; then
-        print_colored "green" "✅ Ważne certyfikaty: $valid_count"
+        print_colored "green" "✅ Ważne: $valid_count"
     fi
 else
-    print_colored "yellow" "ℹ️  Nie znaleziono certyfikatów dla '$CERT_NAME'"
+    print_colored "yellow" "ℹ️  Brak wyników dla '$CERT_NAME'"
     echo ""
-    echo "💡 Wskazówki:"
-    echo "   • Sprawdź czy nazwa jest poprawna"
-    echo "   • Spróbuj użyć części nazwy (np. 'example' zamiast 'www.example.com')"
-    echo "   • Sprawdź czy plik bundla zawiera certyfikaty w formacie PEM"
-    echo "   • Użyj opcji --debug aby zobaczyć wszystkie przetwarzane certyfikaty"
+    echo "💡 Spróbuj:"
+    echo "   • Sprawdzić pisownię nazwy"
+    echo "   • Użyć opcji --debug"
+    echo "   • Sprawdzić format bundla (musi być PEM)"
 fi
 
 echo ""
-echo "✅ Analiza zakończona: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "✅ Zakończono: $(date '+%H:%M:%S')"
