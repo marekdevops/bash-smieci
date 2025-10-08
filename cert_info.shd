@@ -190,38 +190,47 @@ cert_matches_name() {
     local cert_text=$(openssl x509 -in "$cert_file" -text -noout 2>/dev/null)
     [ $? -ne 0 ] && return 1
     
-    # Przygotuj różne warianty nazwy do wyszukiwania
-    local search_patterns=(
-        "$search_name"                    # dokładna nazwa
-        "\\*\\.$search_name"             # wildcard (*.example.com)
-        "CN=.*$search_name"              # w CN
-        "DNS:.*$search_name"             # w SAN jako DNS
-        "DNS:$search_name"               # dokładnie w SAN
-        "DNS:\\*\\.$search_name"         # wildcard w SAN
+    [ "$DEBUG" = true ] && echo "   🔍 Szukam: '$search_name'"
+    
+    # 1. Najprostsze sprawdzenie - czy nazwa występuje gdziekolwiek
+    if echo "$cert_text" | grep -qi "$search_name"; then
+        [ "$DEBUG" = true ] && echo "   ✓ Znaleziono '$search_name' w certyfikacie"
+        return 0
+    fi
+    
+    # 2. Sprawdź z różnymi prefiksami/sufiksami dla domeny
+    local domain_patterns=(
+        "\\.$search_name"           # .example.com
+        "$search_name\\."           # example.com.
+        "\\*\\.$search_name"        # *.example.com
+        "CN=.*$search_name"         # CN=coś z example.com
+        "DNS:.*$search_name"        # DNS:coś z example.com
     )
     
-    # Sprawdź każdy wzorzec
-    for pattern in "${search_patterns[@]}"; do
-        # Sprawdź w Subject
-        if echo "$cert_text" | grep "Subject:" | grep -qi "$pattern"; then
-            [ "$DEBUG" = true ] && echo "   ✓ Znaleziono w Subject: $pattern"
-            return 0
-        fi
-        
-        # Sprawdź w Subject Alternative Names
-        if echo "$cert_text" | grep -A20 "Subject Alternative Name:" | grep -qi "$pattern"; then
-            [ "$DEBUG" = true ] && echo "   ✓ Znaleziono w SAN: $pattern"
+    for pattern in "${domain_patterns[@]}"; do
+        if echo "$cert_text" | grep -qi "$pattern"; then
+            [ "$DEBUG" = true ] && echo "   ✓ Znaleziono wzorzec: $pattern"
             return 0
         fi
     done
     
-    # Dodatkowe sprawdzenie - czy nazwa występuje gdziekolwiek w certyfikacie
-    if echo "$cert_text" | grep -qi "$search_name"; then
-        [ "$DEBUG" = true ] && echo "   ✓ Znaleziono ogólnie w certyfikacie: $search_name"
+    # 3. Sprawdź czy to może być część większej nazwy domeny
+    # Np. szukamy "google" a w certyfikacie jest "www.google.com"
+    if echo "$cert_text" | grep -i "CN=" | grep -qi "[a-zA-Z0-9.-]*$search_name[a-zA-Z0-9.-]*"; then
+        [ "$DEBUG" = true ] && echo "   ✓ Znaleziono '$search_name' jako część domeny w CN"
         return 0
     fi
     
-    [ "$DEBUG" = true ] && echo "   ✗ Nie znaleziono: $search_name"
+    # 4. Sprawdź w SAN (Subject Alternative Names)
+    local san_section=$(echo "$cert_text" | grep -A 10 "Subject Alternative Name:" | grep "DNS:")
+    if [ ! -z "$san_section" ]; then
+        if echo "$san_section" | grep -qi "$search_name"; then
+            [ "$DEBUG" = true ] && echo "   ✓ Znaleziono '$search_name' w SAN"
+            return 0
+        fi
+    fi
+    
+    [ "$DEBUG" = true ] && echo "   ✗ Nie znaleziono: '$search_name'"
     return 1
 }
 
@@ -232,12 +241,23 @@ for cert_file in "$TEMP_DIR"/cert_*.pem; do
     # Debug - pokaż informacje o każdym certyfikacie
     if [ "$DEBUG" = true ]; then
         cert_subject=$(openssl x509 -in "$cert_file" -subject -noout 2>/dev/null | sed 's/subject=//')
-        echo "🔍 DEBUG: Sprawdzam certyfikat: $cert_subject"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "🔍 DEBUG: Certyfikat #$(basename "$cert_file" .pem | sed 's/cert_//')"
+        echo "   Subject: $cert_subject"
         
-        # Pokaż SAN jeśli istnieje
-        san_info=$(openssl x509 -in "$cert_file" -text -noout 2>/dev/null | grep -A1 "Subject Alternative Name:" | tail -n1)
-        if [ ! -z "$san_info" ]; then
-            echo "   SAN: $san_info"
+        # Pokaż wszystkie DNS nazwy z SAN
+        san_dns=$(openssl x509 -in "$cert_file" -text -noout 2>/dev/null | grep -A 20 "Subject Alternative Name:" | grep "DNS:" | sed 's/.*DNS://g' | tr ',' '\n' | sed 's/^[ \t]*//' | grep -v "^$")
+        if [ ! -z "$san_dns" ]; then
+            echo "   DNS w SAN:"
+            echo "$san_dns" | while read -r dns_name; do
+                [ ! -z "$dns_name" ] && echo "     • $dns_name"
+            done
+        fi
+        
+        # Wyciągnij CN z Subject
+        cn_name=$(echo "$cert_subject" | grep -o "CN=[^,]*" | sed 's/CN=//' | head -n1)
+        if [ ! -z "$cn_name" ]; then
+            echo "   CN: $cn_name"
         fi
     fi
     
