@@ -21,10 +21,11 @@ show_help() {
     echo "Użycie: $0 [OPCJE] NAZWA_CERTYFIKATU PLIK_BUNDLA"
     echo ""
     echo "Wyciąga i wyświetla informacje o certyfikatach z bundla dla podanej nazwy."
+    echo "Obsługuje standardowe formaty PEM oraz Red Hat ca-bundle.trust.crt z sekcjami TRUST."
     echo ""
     echo "Argumenty:"
     echo "  NAZWA_CERTYFIKATU  Nazwa certyfikatu do wyszukania (np. example.com)"
-    echo "  PLIK_BUNDLA        Ścieżka do pliku z bundlem certyfikatów"
+    echo "  PLIK_BUNDLA        Ścieżka do pliku z bundlem certyfikatów (PEM lub Red Hat .trust.crt)"
     echo ""
     echo "Opcje:"
     echo "  -h, --help         Wyświetl tę pomoc"
@@ -153,9 +154,19 @@ trap 'rm -rf "$TEMP_DIR"' EXIT
 
 echo "🔎 Rozdzielanie certyfikatów z bundla..."
 
-# Użyj prostej metody AWK do podziału bundla - sprawdzona i niezawodna
+# AWK z obsługą formatu Red Hat ca-bundle.trust.crt (ignoruje komentarze i sekcje TRUST)
 awk '
-BEGIN { cert_num = 0 }
+BEGIN { cert_num = 0; in_cert = 0; skip_trusted = 0 }
+
+# Pomiń komentarze
+/^#/ { next }
+
+# Pomiń sekcje TRUSTED CERTIFICATE (format Red Hat)
+/-----BEGIN TRUSTED CERTIFICATE-----/ { skip_trusted = 1; next }
+/-----END TRUSTED CERTIFICATE-----/ { skip_trusted = 0; next }
+skip_trusted { next }
+
+# Obsłuż normalne certyfikaty
 /-----BEGIN CERTIFICATE-----/ {
     cert_num++
     filename = "'$TEMP_DIR'/cert_" cert_num ".pem"
@@ -174,7 +185,7 @@ BEGIN { cert_num = 0 }
 in_cert {
     print $0 >> filename
 }
-END { print "Podzielono na " cert_num " certyfikatów" }
+END { print "Podzielono na " cert_num " certyfikatów (format Red Hat obsługiwany)" }
 ' "$BUNDLE_FILE"
 
 # Policz ile plików certyfikatów zostało utworzonych
@@ -200,7 +211,13 @@ for cert_file in "${cert_files[@]}"; do
     
     # Sprawdź poprawność certyfikatu
     if ! openssl x509 -in "$cert_file" -noout 2>/dev/null; then
-        [ "$DEBUG" = true ] && echo "❌ Certyfikat $cert_num: uszkodzony, pomijam"
+        if [ "$DEBUG" = true ]; then
+            echo "❌ Certyfikat $cert_num: uszkodzony, pomijam"
+            echo "   Pierwsze 3 linie pliku:"
+            head -3 "$cert_file" 2>/dev/null | sed 's/^/   /'
+            echo "   Ostatnie 3 linie pliku:"
+            tail -3 "$cert_file" 2>/dev/null | sed 's/^/   /'
+        fi
         continue
     fi
     
