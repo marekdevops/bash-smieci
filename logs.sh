@@ -4,6 +4,20 @@ set -eo pipefail
 # Konfiguracja blokady
 LOCK_FILE="/tmp/${SCRIPT_NAME}.lock"
 
+# Funkcja sprawdzająca i usuwająca stary plik blokady
+cleanup_old_lock() {
+    if [ -f "${LOCK_FILE}" ]; then
+        # Sprawdź czy plik jest starszy niż 1 dzień (1440 minut)
+        if [ $(find "${LOCK_FILE}" -mmin +1440 2>/dev/null | wc -l) -gt 0 ]; then
+            echo "Usuwanie starego pliku blokady (starszy niż 1 dzień): ${LOCK_FILE}"
+            rm -f "${LOCK_FILE}"
+        fi
+    fi
+}
+
+# Sprawdź i usuń stary plik blokady przed utworzeniem nowego
+cleanup_old_lock
+
 # Blokada plikowa z timeout 0 (natychmiastowe wyjście jeśli zablokowane)
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
