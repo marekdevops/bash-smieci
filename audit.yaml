@@ -1,0 +1,68 @@
+#!/bin/bash
+
+# Sprawdzenie uprawnień (wymagane root do odczytu /etc/shadow)
+if [ "$EUID" -ne 0 ]; then 
+  echo "Proszę uruchomić skrypt z uprawnieniami root (sudo)."
+  exit
+fi
+
+echo "================================================================"
+echo "RAPORT AUDYTU UŻYTKOWNIKÓW I POLITYK HASIEŁ - RED HAT"
+echo "Data: $(date)"
+echo "================================================================"
+
+echo -e "\n[1. LISTA UŻYTKOWNIKÓW, STATUS I OSTATNIE LOGOWANIE]"
+printf "%-20s %-15s %-20s\n" "Użytkownik" "Status" "Ostatnie logowanie"
+printf "%-20s %-15s %-20s\n" "----------" "------" "------------------"
+
+while IFS=: wrap_user= read -r username x uid gid desc home shell; do
+    # Pobranie daty ostatniego logowania (lastlog)
+    last_login=$(lastlog -u "$username" | tail -n 1 | awk '{print $4,$5,$6,$9}')
+    if [[ "$last_login" == *"Never"* || -z "$last_login" ]]; then last_login="Nigdy"; fi
+
+    # Sprawdzenie czy konto jest zablokowane (L w /etc/shadow)
+    status_raw=$(passwd -S "$username" | awk '{print $2}')
+    case $status_raw in
+        L) status="Zablokowane" ;;
+        P) status="Aktywne" ;;
+        NP) status="Brak hasła" ;;
+        *) status="Nieznany" ;;
+    esac
+
+    printf "%-20s %-15s %-20s\n" "$username" "$status" "$last_login"
+done < <(getent passwd | grep -E '/bin/bash|/bin/sh|/bin/zsh') # Tylko użytkownicy z powłoką
+
+echo -e "\n[2. POLITYKI CZASU ŻYCIA HASŁA (Wartości domyślne /etc/login.defs)]"
+grep -E '^PASS_MAX_DAYS|^PASS_MIN_DAYS|^PASS_WARN_AGE' /etc/login.defs
+
+echo -e "\n[3. MINIMALNA DŁUGOŚĆ HASŁA I SKŁADNIA (pwquality)]"
+if [ -f /etc/security/pwquality.conf ]; then
+    grep -E '^minlen|^dcredit|^ucredit|^lcredit|^ocredit' /etc/security/pwquality.conf
+else
+    echo "Plik /etc/security/pwquality.conf nie istnieje - sprawdź konfigurację PAM."
+fi
+
+echo -e "\n[4. BLOKOWANIE KONTA PO NIEUDANYCH LOGOWANIACH (faillock)]"
+if [ -f /etc/security/faillock.conf ]; then
+    grep -E '^deny|^unlock_time|^even_deny_root' /etc/security/faillock.conf
+else
+    echo "Szczegóły w /etc/pam.d/password-auth (moduł pam_faillock)."
+fi
+
+echo -e "\n[5. HISTORIA HASIEŁ (pamiętanie poprzednich)]"
+grep -r "pam_pwhistory.so" /etc/pam.d/system-auth /etc/pam.d/password-auth | grep "remember" || echo "Nie znaleziono wymuszenia historii (pamiętania) haseł."
+
+echo -e "\n[6. WYMUSZENIE ZMIANY HASŁA PO PIERWSZYM LOGOWANIU]"
+echo "Weryfikacja parametru 'Last password change' dla nowych kont (0 oznacza wymuszenie):"
+echo "Przykład dla usera 'root': $(chage -l root | grep 'Last password change')"
+
+echo -e "\n[7. SZYFROWANIE HASIEŁ W SYSTEMIE]"
+grep "^ENCRYPT_METHOD" /etc/login.defs || echo "Domyślnie w RHEL: SHA512 (sprawdź /etc/shadow)"
+echo "Przykładowy hash z /etc/shadow (pierwsze znaki): $(grep '^root:' /etc/shadow | cut -d: -f2 | cut -c1-3) (ID: \$6\$ to SHA-512)"
+
+echo -e "\n[8. TRANSMISJA HASŁA (STACJA <-> SERWER)]"
+echo "W systemach Linux hasła są przesyłane bezpiecznie tylko przez protokoły szyfrowane (SSH/TLS)."
+echo "Status SSH: $(systemctl is-active sshd)"
+echo "Weryfikacja zakazu logowania Roota przez SSH: $(grep "^PermitRootLogin" /etc/ssh/sshd_config || echo "Domyślnie: Prohibit-password")"
+
+echo -e "\n--- KONIEC RAPORTU ---"
