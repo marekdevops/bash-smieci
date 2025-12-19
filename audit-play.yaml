@@ -1,0 +1,40 @@
+---
+- name: Audyt bezpieczeństwa RHEL
+  hosts: all
+  become: yes  # <--- TO WŁĄCZA SUDO
+  gather_facts: no
+  vars:
+    local_results_path: "./wyniki_audytu"
+
+  tasks:
+    - name: Przygotuj folder na wyniki lokalnie
+      delegate_to: localhost
+      become: no
+      file:
+        path: "{{ local_results_path }}"
+        state: directory
+      run_once: true
+
+    - name: Prześlij skrypt na serwer
+      copy:
+        src: audit_rhel.sh
+        dest: /tmp/audit_rhel.sh
+        mode: '0700' # Tylko właściciel (root) może czytać i wykonywać
+
+    - name: Wykonaj audyt
+      shell: "/tmp/audit_rhel.sh > /tmp/audit_report.txt"
+      # Dzięki become: yes, powyższa komenda wykona się jako root
+
+    - name: Pobierz raport na stację roboczą
+      fetch:
+        src: "/tmp/audit_report.txt"
+        dest: "{{ local_results_path }}/audit_{{ inventory_hostname }}.txt"
+        flat: yes
+
+    - name: Posprzątaj na serwerze
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /tmp/audit_rhel.sh
+        - /tmp/audit_report.txt
