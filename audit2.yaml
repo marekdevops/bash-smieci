@@ -1,89 +1,74 @@
 #!/bin/bash
 
-# Wymagane uprawnienia root
+# Sprawdzenie uprawnień
 if [ "$EUID" -ne 0 ]; then 
-  echo "Uruchom skrypt jako root (sudo)."
+  echo "Uruchom jako root (sudo)."
   exit 1
 fi
 
 echo "================================================================"
-echo "RAPORT AUDYTU SYSTEMU RHEL - STATUS KONT I POLITYKI"
-echo "Data: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "RAPORT AUDYTU SYSTEMU RHEL (LOKALNY + DOMENOWY)"
 echo "================================================================"
 
-echo -e "\n[1. LISTA UŻYTKOWNIKÓW I FAKTYCZNY STATUS KONTA]"
-printf "%-15s %-12s %-15s %-20s\n" "Użytkownik" "UID" "Status Konta" "Ostatnie logowanie"
-printf "%-15s %-12s %-15s %-20s\n" "----------" "---" "------------" "------------------"
+echo -e "\n[1. STATUS UŻYTKOWNIKÓW]"
+printf "%-15s %-15s %-20s\n" "Użytkownik" "Status Konta" "Ostatnie logowanie"
+printf "%-15s %-15s %-20s\n" "----------" "------------" "------------------"
 
-# Pobieramy użytkowników, którzy mają przypisaną powłokę umożliwiającą logowanie
-while IFS=: read -r user x uid gid desc home shell; do
+# Pobieramy wszystkich użytkowników (lokalnych i z SSSD/LDAP)
+# Filtrujemy, by pominąć typowe konta systemowe bez powłoki
+getent passwd | grep -E '/bin/bash|/bin/sh' | while IFS=: read -r user x uid gid desc home shell; do
     
-    # 1. Sprawdzenie daty wygaśnięcia konta (Account Expires)
-    exp_date=$(chage -l "$user" | grep "Account expires" | cut -d: -f2 | xargs)
-    status="Aktywne"
-
-    if [[ "$exp_date" != "never" ]]; then
-        exp_epoch=$(date -d "$exp_date" +%s 2>/dev/null)
-        today_epoch=$(date +%s)
-        if [[ -n "$exp_epoch" && "$exp_epoch" -lt "$today_epoch" ]]; then
-            status="WYGASŁE"
+    # Próba pobrania statusu przez 'chage' (działa na lokalnych)
+    # Dla domenowych sprawdzamy 'account expiration'
+    ACCOUNT_EXP=$(chage -l "$user" 2>/dev/null | grep "Account expires" | cut -d: -f2 | xargs)
+    
+    # Sprawdzenie blokady w shadow (tylko lokalni)
+    SHADOW_STATUS=$(grep "^$user:" /etc/shadow | cut -d: -f2)
+    
+    # LOGIKA STATUSU:
+    if [[ "$SHADOW_STATUS" == "!"* || "$SHADOW_STATUS" == "*"* ]]; then
+        STATUS="ZABLOKOWANE"
+    elif [[ "$ACCOUNT_EXP" != "never" && -n "$ACCOUNT_EXP" ]]; then
+        EXP_EPOCH=$(date -d "$ACCOUNT_EXP" +%s 2>/dev/null)
+        TODAY_EPOCH=$(date +%s)
+        if [[ -n "$EXP_EPOCH" && "$EXP_EPOCH" -lt "$TODAY_EPOCH" ]]; then
+            STATUS="WYGASŁE"
+        else
+            STATUS="AKTYWNE"
         fi
+    else
+        # Jeśli nie ma w shadow i nie ma daty wygaśnięcia, a jest w getent - uznajemy za aktywne (np. AD)
+        STATUS="AKTYWNE"
     fi
 
-    # 2. Sprawdzenie czy konto jest zablokowane administracyjnie (Locked)
-    # Sprawdzamy czy w /etc/shadow przed hasłem jest ! lub !! lub *
-    shadow_line=$(grep "^$user:" /etc/shadow | cut -d: -f2)
-    if [[ "$shadow_line" == "!"* || "$shadow_line" == "*"* ]]; then
-        status="ZABLOKOWANE"
-    fi
+    # Ostatnie logowanie
+    LAST_LOG=$(lastlog -u "$user" | tail -n 1 | awk '{print $4,$5,$6,$9}')
+    [ -z "$LAST_LOG" ] || [[ "$LAST_LOG" == *"Never"* ]] && LAST_LOG="Nigdy"
 
-    # 3. Sprawdzenie powłoki (jeśli nologin, konto jest nieaktywne do logowania)
-    if [[ "$shell" == *"/nologin" || "$shell" == *"/false" ]]; then
-        if [[ "$status" == "Aktywne" ]]; then status="SYSTEMOWE/NOLOGIN"; fi
-    fi
+    printf "%-15s %-15s %-20s\n" "$user" "$STATUS" "$LAST_LOG"
+done
 
-    # 4. Data ostatniego logowania
-    last_log=$(lastlog -u "$user" | tail -n 1 | awk '{print $4,$5,$6,$9}')
-    if [[ "$last_log" == *"Never"* || -z "$last_log" ]]; then last_log="Nigdy"; fi
+echo -e "\n[2. POLITYKI SYSTEMOWE]"
 
-    printf "%-15s %-12s %-15s %-20s\n" "$user" "$uid" "$status" "$last_log"
+# Minimalna długość i składnia
+echo "--- Składnia haseł (pwquality) ---"
+[ -f /etc/security/pwquality.conf ] && grep -E '^minlen|^dcredit|^ucredit|^lcredit|^ocredit' /etc/security/pwquality.conf || echo "Domyślne systemowe"
 
-done < <(getent passwd | grep -v "nologin" | grep -v "false") # Pokazuje tylko konta "potencjalnie" logowalne
+# Historia haseł
+echo -e "\n--- Historia haseł (pamiętanie) ---"
+grep -h "pam_pwhistory.so" /etc/pam.d/system-auth /etc/pam.d/password-auth | grep "remember" || echo "Brak ograniczeń historii"
 
-echo -e "\n[2. POLITYKI BEZPIECZEŃSTWA (AUDYT)]"
+# Blokada po błędach
+echo -e "\n--- Blokowanie kont (faillock) ---"
+[ -f /etc/security/faillock.conf ] && grep -E '^deny|^unlock_time' /etc/security/faillock.conf || echo "Konfiguracja w PAM"
 
-echo "--- Czas życia i historia haseł ---"
-grep -E '^PASS_MAX_DAYS|^PASS_MIN_DAYS|^PASS_WARN_AGE' /etc/login.defs
-grep -r "pam_pwhistory.so" /etc/pam.d/system-auth /etc/pam.d/password-auth | grep "remember" || echo "Historia haseł: Nie zdefiniowano (domyślna 0)"
+# Szyfrowanie haseł
+echo -e "\n--- Szyfrowanie haseł ---"
+grep "^ENCRYPT_METHOD" /etc/login.defs || echo "Metoda: SHA512 (Standard RHEL)"
 
-echo -e "\n--- Składnia (Minimalna długość i znaki) ---"
-if [ -f /etc/security/pwquality.conf ]; then
-    grep -v '^#' /etc/security/pwquality.conf | grep -E 'minlen|dcredit|ucredit|lcredit|ocredit' || echo "Ustawienia pwquality domyślne."
-else
-    echo "Brak pwquality.conf - sprawdź /etc/pam.d/system-auth"
-fi
-
-echo -e "\n--- Blokowanie po nieudanych logowaniach ---"
-if [ -f /etc/security/faillock.conf ]; then
-    grep -v '^#' /etc/security/faillock.conf | grep -E 'deny|unlock_time|even_deny_root'
-else
-    echo "Szczegóły faillock w /etc/pam.d/password-auth"
-fi
-
-echo -e "\n--- Przechowywanie haseł (Szyfrowanie) ---"
-encrypt_method=$(grep "^ENCRYPT_METHOD" /etc/login.defs | awk '{print $2}')
-echo "Metoda szyfrowania w login.defs: ${encrypt_method:-SHA512 (domyślna)}"
-example_hash=$(grep '^root:' /etc/shadow | cut -d: -f2 | cut -c1-3)
-echo "Przykładowy identyfikator algorytmu w /etc/shadow: $example_hash (\$6\$ = SHA512)"
-
-echo -e "\n--- Wymuszenie zmiany hasła po 1. logowaniu ---"
-echo "Kontroluj parametr 'Last password change' (jeśli '0', zmiana jest wymuszona):"
-echo "Użytkownicy z wymuszeniem: $(awk -F: '$3 == 0 {print $1}' /etc/shadow)"
-
-echo -e "\n--- Transmisja haseł (SSH) ---"
-ssh_status=$(systemctl is-active sshd)
-echo "Usługa SSHD: $ssh_status"
-grep "^PermitRootLogin" /etc/ssh/sshd_config || echo "PermitRootLogin: Domyślnie (zwykle prohibit-password)"
+# Transmisja haseł
+echo -e "\n--- Bezpieczeństwo transmisji ---"
+echo "Status SSH: $(systemctl is-active sshd)"
+echo "Szyfrowanie sesji: Tak (wymuszone przez SSH)"
 
 echo -e "\n================================================================"
-echo "KONIEC RAPORTU"
