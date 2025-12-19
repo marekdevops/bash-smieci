@@ -77,6 +77,24 @@ if [ -f "$PWQ" ]; then
     grep -v '^#' "$PWQ" | grep -E 'minlen|dcredit|ucredit|lcredit|ocredit' || echo "STATUS: Ustawienia domyślne."
 fi
 
+echo "----------------------------------------------------------------"
+PWQ="/etc/security/pwquality.conf"
+# Pobieramy parametry z pliku konfiguracyjnego
+MINLEN=$(grep "^minlen" $PWQ | cut -d'=' -f2 | xargs)
+DCRED=$(grep "^dcredit" $PWQ | cut -d'=' -f2 | xargs)
+UCRED=$(grep "^ucredit" $PWQ | cut -d'=' -f2 | xargs)
+LCRED=$(grep "^lcredit" $PWQ | cut -d'=' -f2 | xargs)
+OCRED=$(grep "^ocredit" $PWQ | cut -d'=' -f2 | xargs)
+
+# Jeśli puste, podstawiamy standardowe wartości domyślne RHEL
+echo "Minimalna długość hasła: ${MINLEN:-8 (Domyślnie)}"
+echo "Wymagane cyfry (dcredit): ${DCRED:-0 (Domyślnie)}"
+echo "Wymagane wielkie litery (ucredit): ${UCRED:-0 (Domyślnie)}"
+echo "Wymagane małe litery (lcredit): ${LCRED:-0 (Domyślnie)}"
+echo "Wymagane znaki specjalne (ocredit): ${OCRED:-0 (Domyślnie)}"
+
+echo -e "\nINFO: Wartość ujemna (np. -1) oznacza obowiązkowe wystąpienie min. 1 znaku danego typu."
+
 echo -e "\n[3. BLOKOWANIE KONTA PO BŁĘDNYCH LOGOWANIACH]"
 echo "----------------------------------------------------------------"
 if grep -q "pam_faillock.so" /etc/pam.d/password-auth; then
