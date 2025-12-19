@@ -12,44 +12,49 @@ echo "         Data:     $(date '+%Y-%m-%d %H:%M:%S')"
 echo "================================================================"
 
 echo -e "\n[1. LISTA I STATUS LOKALNYCH UŻYTKOWNIKÓW]"
-printf "%-18s %-12s %-25s %-20s\n" "Użytkownik" "UID" "Status Konta" "Ostatnie logowanie"
-printf "%-18s %-12s %-25s %-20s\n" "----------" "---" "------------" "------------------"
-
-# Pobieramy listę aktualnie zalogowanych, by uniknąć fałszywych blokad
-CURRENTLY_LOGGED=$(who | awk '{print $1}' | sort -u)
+printf "%-18s %-12s %-15s %-20s\n" "Użytkownik" "UID" "Status" "Ostatnie logowanie"
+printf "%-18s %-12s %-15s %-20s\n" "----------" "---" "------" "------------------"
 
 while IFS=: read -r user x uid gid desc home shell; do
+    # Analizujemy tylko root (0) i konta zwykłych użytkowników (>=1000)
     if [ "$uid" -eq 0 ] || [ "$uid" -ge 1000 ]; then
         
         shadow_line=$(grep "^$user:" /etc/shadow)
         password_field=$(echo "$shadow_line" | cut -d: -f2)
         expire_field=$(echo "$shadow_line" | cut -d: -f8)
         
+        # DOMYŚLNIE ZAKŁADAMY, ŻE AKTYWNE
         STATUS="Aktywne"
 
-        # 1. Sprawdzenie wygaśnięcia KONTA (blokada bezwzględna)
+        # 1. SPRAWDZENIE BLOKADY KONTA (BEZWZGLĘDNE)
+        # Jeśli konto wygasło (data w shadow)
         if [ -n "$expire_field" ]; then
             today_epoch=$(($(date +%s) / 86400))
             if [ "$expire_field" -le "$today_epoch" ]; then
-                STATUS="WYGASŁE (Konto)"
+                STATUS="Wygasłe"
             fi
         fi
 
-        # 2. Sprawdzenie powłoki
+        # Jeśli powłoka to nologin/false (brak możliwości wejścia)
         if [[ "$shell" == *"/nologin" || "$shell" == *"/false" ]]; then
-            STATUS="ZABLOKOWANE (Shell)"
+            STATUS="Zablokowane"
         fi
 
-        # 3. Analiza pola hasła i logowania SSH
-        # Jeśli użytkownik jest teraz zalogowany, to znaczy że konto DZIAŁA
-        if echo "$CURRENTLY_LOGGED" | grep -qwq "$user"; then
-            STATUS="Aktywne (Zalogowany)"
-        elif [[ "$password_field" == "!"* || "$password_field" == "*"* || "$password_field" == "!!"* ]]; then
-            # Sprawdzamy czy ma klucze SSH - jeśli tak, to 'Zablokowane' w shadow oznacza tylko 'Brak logowania hasłem'
-            if [ -f "$home/.ssh/authorized_keys" ]; then
-                STATUS="Aktywne (Tylko SSH)"
-            else
-                STATUS="ZABLOKOWANE"
+        # 2. SPRAWDZENIE DOSTĘPNOŚCI (HASŁO LUB KLUCZ)
+        # Jeśli hasło jest zablokowane (! lub *), sprawdzamy czy są klucze SSH.
+        # Jeśli nie ma ani hasła, ani kluczy, a użytkownik nie jest teraz zalogowany -> Zablokowane.
+        if [[ "$password_field" == "!"* || "$password_field" == "*"* ]]; then
+            # Sprawdź czy użytkownik ma klucze SSH
+            has_ssh=false
+            [ -f "$home/.ssh/authorized_keys" ] && has_ssh=true
+            
+            # Sprawdź czy jest aktualnie zalogowany (skoro Ty to robisz, to Twoje konto przejdzie ten test)
+            is_logged=false
+            who | grep -qw "$user" && is_logged=true
+
+            if [ "$has_ssh" = false ] && [ "$is_logged" = false ]; then
+                # Jeśli nie ma hasła, nie ma kluczy i nie jest zalogowany - uznajemy za zablokowane
+                STATUS="Zablokowane"
             fi
         fi
 
@@ -61,7 +66,7 @@ while IFS=: read -r user x uid gid desc home shell; do
             last_log_fmt=$(echo "$last_log_raw" | awk '{for(i=4;i<=NF;i++) printf $i" "; print ""}')
         fi
 
-        printf "%-18s %-12s %-25s %-20s\n" "$user" "$uid" "$STATUS" "$last_log_fmt"
+        printf "%-18s %-12s %-15s %-20s\n" "$user" "$uid" "$STATUS" "$last_log_fmt"
     fi
 done < /etc/passwd
 
@@ -69,17 +74,16 @@ echo -e "\n[2. POLITYKI SKŁADNI HASEŁ]"
 echo "----------------------------------------------------------------"
 PWQ="/etc/security/pwquality.conf"
 if [ -f "$PWQ" ]; then
-    grep -v '^#' "$PWQ" | grep -E 'minlen|dcredit|ucredit|lcredit|ocredit' || echo "Brak specyficznej konfiguracji."
+    grep -v '^#' "$PWQ" | grep -E 'minlen|dcredit|ucredit|lcredit|ocredit' || echo "STATUS: Ustawienia domyślne."
 fi
 
-echo -e "\n[3. BLOKOWANIE KONTA (Faillock)]"
+echo -e "\n[3. BLOKOWANIE KONTA PO BŁĘDNYCH LOGOWANIACH]"
 echo "----------------------------------------------------------------"
-FL_CONF="/etc/security/faillock.conf"
 if grep -q "pam_faillock.so" /etc/pam.d/password-auth; then
-    echo "Status: WŁĄCZONE"
-    [ -f "$FL_CONF" ] && grep -v '^#' "$FL_CONF" | grep -E 'deny|unlock_time'
+    echo "STATUS: Aktywne"
+    [ -f /etc/security/faillock.conf ] && grep -v '^#' /etc/security/faillock.conf | grep -E 'deny|unlock_time'
 else
-    echo "Status: WYŁĄCZONE (Brak pam_faillock w PAM)"
+    echo "STATUS: Brak blokady (Błąd krytyczny audytu)"
 fi
 
 echo -e "\n[4. HISTORIA HASIEŁ]"
@@ -87,9 +91,9 @@ echo "----------------------------------------------------------------"
 HIST_LINE=$(grep -h "pam_pwhistory.so" /etc/pam.d/system-auth /etc/pam.d/password-auth | head -1)
 if [ -n "$HIST_LINE" ]; then
     REM_VAL=$(echo "$HIST_LINE" | tr ' ' '\n' | grep "remember" | cut -d'=' -f2)
-    echo "Status: WŁĄCZONE (Pamięta: ${REM_VAL:-0} hasła)"
+    echo "STATUS: Aktywne (Pamięta: $REM_VAL)"
 else
-    echo "Status: WYŁĄCZONE"
+    echo "STATUS: Brak (Użytkownik może powtarzać hasła)"
 fi
 
 echo -e "\n[5. SZYFROWANIE HASŁA]"
@@ -97,9 +101,9 @@ echo "----------------------------------------------------------------"
 METHOD=$(grep "^ENCRYPT_METHOD" /etc/login.defs | awk '{print $2}')
 echo "Metoda: ${METHOD:-SHA512}"
 ID_HASH=$(grep '^root:' /etc/shadow | cut -d: -f2 | cut -c1-3)
-echo "Hash w shadow: $ID_HASH (\$6\$ = SHA-512)"
+echo "Hash ID: $ID_HASH (ID \$6\$ to SHA-512)"
 
-echo -e "\n[6. WYMUSZONA ZMIANA HASŁA PO 1. LOGOWANIU]"
+echo -e "\n[6. WYMUSZONA ZMIANA HASŁA]"
 echo "----------------------------------------------------------------"
 awk -F: '$3 == 0 {print "Wymuszona zmiana dla: " $1}' /etc/shadow || echo "Brak."
 
