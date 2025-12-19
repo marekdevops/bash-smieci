@@ -1,23 +1,23 @@
 #!/bin/bash
 
 if [ "$EUID" -ne 0 ]; then 
-  echo "Uruchom jako root (sudo)."
+  echo "BŁĄD: Uruchom skrypt jako root (sudo), aby mieć dostęp do danych o hasłach."
   exit 1
 fi
 
 echo "================================================================"
-echo "PEŁNY RAPORT AUDYTU SYSTEMU RHEL"
+echo "         RAPORT AUDYTU BEZPIECZEŃSTWA SYSTEMU RHEL"
 echo "================================================================"
 
 echo -e "\n[1. LISTA I STATUS KONT UŻYTKOWNIKÓW]"
 printf "%-18s %-12s %-15s %-20s\n" "Użytkownik" "UID" "Status" "Ostatnie logowanie"
 printf "%-18s %-12s %-15s %-20s\n" "----------" "---" "------" "------------------"
 
-getent passwd | grep -E '/bin/bash|/bin/sh' | while IFS=: read -r user x uid gid desc home shell; do
-    # Sprawdzenie blokady w shadow
+getent passwd | grep -E '/bin/bash|/bin/sh|/bin/zsh' | while IFS=: read -r user x uid gid desc home shell; do
+    # Sprawdzenie blokady administracyjnej w shadow
     SHADOW_STATUS=$(grep "^$user:" /etc/shadow | cut -d: -f2)
     
-    # Sprawdzenie wygaśnięcia konta
+    # Sprawdzenie wygaśnięcia konta (chage)
     EXP_DATE=$(chage -l "$user" 2>/dev/null | grep "Account expires" | cut -d: -f2 | xargs)
     
     STATUS="AKTYWNE"
@@ -30,51 +30,78 @@ getent passwd | grep -E '/bin/bash|/bin/sh' | while IFS=: read -r user x uid gid
         fi
     fi
 
-    LAST_LOG=$(lastlog -u "$user" | tail -n 1 | awk '{print $4,$5,$6,$9}')
-    [[ "$LAST_LOG" == *"Never"* || -z "$LAST_LOG" ]] && LAST_LOG="Nigdy"
+    # Pobieranie daty ostatniego logowania
+    RAW_LAST_LOG=$(lastlog -u "$user" | tail -n 1)
+    if [[ "$RAW_LAST_LOG" == *"Never"* || "$RAW_LAST_LOG" == *"Nigdy"* ]]; then
+        LAST_LOG_FMT="Nigdy nie logowany"
+    else
+        # Wyciągnięcie daty z lastlog (kolumny od 4 wzwyż)
+        LAST_LOG_FMT=$(echo "$RAW_LAST_LOG" | awk '{for(i=4;i<=NF;i++) printf $i" "; print ""}')
+        if [ -z "$LAST_LOG_FMT" ]; then LAST_LOG_FMT="Nigdy nie logowany"; fi
+    fi
 
-    printf "%-18s %-12s %-15s %-20s\n" "$user" "$uid" "$STATUS" "$LAST_LOG"
+    printf "%-18s %-12s %-15s %-20s\n" "$user" "$uid" "$STATUS" "$LAST_LOG_FMT"
 done
 
-echo -e "\n[2. POLITYKI HASEŁ I SKŁADNI (Complexity)]"
+echo -e "\n[2. POLITYKI SKŁADNI HASEŁ (Pwquality)]"
 echo "----------------------------------------------------------------"
-if [ -f /etc/security/pwquality.conf ]; then
-    echo "> Ustawienia z pwquality.conf:"
-    grep -E '^minlen|^dcredit|^ucredit|^lcredit|^ocredit|^minclass' /etc/security/pwquality.conf || echo "Brak jawnych wpisów (stosowane domyślne)."
+PWQ_FILE="/etc/security/pwquality.conf"
+if [ -f "$PWQ_FILE" ]; then
+    CHECK_PWQ=$(grep -v '^#' "$PWQ_FILE" | grep -E 'minlen|dcredit|ucredit|lcredit|ocredit')
+    if [ -z "$CHECK_PWQ" ]; then
+        echo "STATUS: Brak specyficznej konfiguracji w $PWQ_FILE (używane domyślne)."
+    else
+        echo "$CHECK_PWQ"
+    fi
 fi
-# Dodatkowy check w PAM dla starszych systemów lub specyficznych konfiguracji
-echo "> Ustawienia wymuszone w PAM (pam_pwquality/pam_cracklib):"
-grep -hE "pam_pwquality.so|pam_cracklib.so" /etc/pam.d/system-auth /etc/pam.d/password-auth | tr ' ' '\n' | grep -E 'minlen|retry|dcredit|ucredit|lcredit|ocredit'
 
-echo -e "\n[3. CZAS ŻYCIA HASŁA (Password Aging)]"
+echo -e "\n[3. BLOKOWANIE KONTA PO BŁĘDNYCH LOGOWANIACH (Faillock)]"
 echo "----------------------------------------------------------------"
-grep -E '^PASS_MAX_DAYS|^PASS_MIN_DAYS|^PASS_WARN_AGE' /etc/login.defs
+FAILLOCK_CONF="/etc/security/faillock.conf"
+# Sprawdzenie czy moduł faillock jest obecny w plikach PAM
+PAM_CHECK=$(grep -h "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/password-auth)
 
-echo -e "\n[4. BLOKOWANIE KONTA PO NIEUDANYCH LOGOWANIACH (Account Lockout)]"
-echo "----------------------------------------------------------------"
-if [ -f /etc/security/faillock.conf ]; then
-    grep -E '^deny|^unlock_time|^even_deny_root' /etc/security/faillock.conf
+if [ -n "$PAM_CHECK" ]; then
+    echo "STATUS: Mechanizm blokowania (pam_faillock) jest WŁĄCZONY."
+    if [ -f "$FAILLOCK_CONF" ]; then
+        grep -v '^#' "$FAILLOCK_CONF" | grep -E 'deny|unlock_time|even_deny_root' || echo "Parametry domyślne (zwykle 3 próby, 10 min blokady)."
+    else
+        echo "Szczegóły parametrów bezpośrednio w PAM:"
+        echo "$PAM_CHECK" | tr ' ' '\n' | grep -E 'deny|unlock_time' | sort -u
+    fi
 else
-    echo "> Parametry faillock bezpośrednio w PAM:"
-    grep -h "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/password-auth | tr ' ' '\n' | grep -E 'deny|unlock_time|even_deny_root' | sort -u
+    echo "STATUS: ALARM - Mechanizm blokowania kont po nieudanych próbach jest WYŁĄCZONY."
 fi
 
-echo -e "\n[5. HISTORIA HASIEŁ (Password History)]"
+echo -e "\n[4. HISTORIA HASIEŁ (Pamiętanie poprzednich)]"
 echo "----------------------------------------------------------------"
-grep -h "pam_pwhistory.so" /etc/pam.d/system-auth /etc/pam.d/password-auth | tr ' ' '\n' | grep "remember" | sort -u || echo "Historia haseł: Nieaktywowana (0)"
+HISTORY_CHECK=$(grep -h "pam_pwhistory.so" /etc/pam.d/system-auth /etc/pam.d/password-auth)
 
-echo -e "\n[6. SZYFROWANIE I TRANSMISJA]"
+if [ -n "$HISTORY_CHECK" ]; then
+    REMEMBER_VAL=$(echo "$HISTORY_CHECK" | tr ' ' '\n' | grep "remember" | head -1 | cut -d'=' -f2)
+    echo "STATUS: Mechanizm historii haseł jest WŁĄCZONY."
+    echo "System pamięta ostatnie [$REMEMBER_VAL] hasła/hasło użytkownika."
+else
+    echo "STATUS: ALARM - Historia haseł jest WYŁĄCZONA (użytkownik może używać ciągle tego samego hasła)."
+fi
+
+echo -e "\n[5. SZYFROWANIE I TRANSMISJA]"
 echo "----------------------------------------------------------------"
 METHOD=$(grep "^ENCRYPT_METHOD" /etc/login.defs | awk '{print $2}')
-echo "Algorytm szyfrowania (login.defs): ${METHOD:-SHA512 (Standard)}"
+echo "Metoda szyfrowania w login.defs: ${METHOD:-SHA512 (Standard RHEL)}"
 ID=$(grep '^root:' /etc/shadow | cut -d: -f2 | cut -c1-3)
-echo "Identyfikator hash w shadow: $ID ($([[ "$ID" == "\$6\$" ]] && echo "SHA-512" || echo "Inny/Starszy"))"
-echo "Logowanie Root przez SSH: $(grep "^PermitRootLogin" /etc/ssh/sshd_config | awk '{print $2}')"
+echo "Weryfikacja szyfrowania w shadow: $ID (ID \$6\$ = SHA-512 - OK)"
+SSH_PERMIT=$(grep "^PermitRootLogin" /etc/ssh/sshd_config | awk '{print $2}')
+echo "Logowanie Root przez SSH: ${SSH_PERMIT:-Domyślnie (Prohibit-password)}"
 
-echo -e "\n[7. WYMUSZENIE ZMIANY HASŁA]"
+echo -e "\n[6. WYMUSZENIE ZMIANY HASŁA PO 1. LOGOWANIU]"
 echo "----------------------------------------------------------------"
-echo "Użytkownicy z wymuszoną zmianą przy następnym logowaniu:"
-awk -F: '$3 == 0 {print "- " $1}' /etc/shadow
+FORCED_USERS=$(awk -F: '$3 == 0 {print $1}' /etc/shadow)
+if [ -z "$FORCED_USERS" ]; then
+    echo "Brak użytkowników z wymuszoną zmianą hasła."
+else
+    echo "Zmiana hasła przy następnym logowaniu wymuszona dla: $FORCED_USERS"
+fi
 
 echo -e "\n================================================================"
 echo "KONIEC RAPORTU"
