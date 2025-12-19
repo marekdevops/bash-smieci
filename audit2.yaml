@@ -1,74 +1,80 @@
 #!/bin/bash
 
-# Sprawdzenie uprawnień
 if [ "$EUID" -ne 0 ]; then 
   echo "Uruchom jako root (sudo)."
   exit 1
 fi
 
 echo "================================================================"
-echo "RAPORT AUDYTU SYSTEMU RHEL (LOKALNY + DOMENOWY)"
+echo "PEŁNY RAPORT AUDYTU SYSTEMU RHEL"
 echo "================================================================"
 
-echo -e "\n[1. STATUS UŻYTKOWNIKÓW]"
-printf "%-15s %-15s %-20s\n" "Użytkownik" "Status Konta" "Ostatnie logowanie"
-printf "%-15s %-15s %-20s\n" "----------" "------------" "------------------"
+echo -e "\n[1. LISTA I STATUS KONT UŻYTKOWNIKÓW]"
+printf "%-18s %-12s %-15s %-20s\n" "Użytkownik" "UID" "Status" "Ostatnie logowanie"
+printf "%-18s %-12s %-15s %-20s\n" "----------" "---" "------" "------------------"
 
-# Pobieramy wszystkich użytkowników (lokalnych i z SSSD/LDAP)
-# Filtrujemy, by pominąć typowe konta systemowe bez powłoki
 getent passwd | grep -E '/bin/bash|/bin/sh' | while IFS=: read -r user x uid gid desc home shell; do
-    
-    # Próba pobrania statusu przez 'chage' (działa na lokalnych)
-    # Dla domenowych sprawdzamy 'account expiration'
-    ACCOUNT_EXP=$(chage -l "$user" 2>/dev/null | grep "Account expires" | cut -d: -f2 | xargs)
-    
-    # Sprawdzenie blokady w shadow (tylko lokalni)
+    # Sprawdzenie blokady w shadow
     SHADOW_STATUS=$(grep "^$user:" /etc/shadow | cut -d: -f2)
     
-    # LOGIKA STATUSU:
+    # Sprawdzenie wygaśnięcia konta
+    EXP_DATE=$(chage -l "$user" 2>/dev/null | grep "Account expires" | cut -d: -f2 | xargs)
+    
+    STATUS="AKTYWNE"
     if [[ "$SHADOW_STATUS" == "!"* || "$SHADOW_STATUS" == "*"* ]]; then
         STATUS="ZABLOKOWANE"
-    elif [[ "$ACCOUNT_EXP" != "never" && -n "$ACCOUNT_EXP" ]]; then
-        EXP_EPOCH=$(date -d "$ACCOUNT_EXP" +%s 2>/dev/null)
-        TODAY_EPOCH=$(date +%s)
-        if [[ -n "$EXP_EPOCH" && "$EXP_EPOCH" -lt "$TODAY_EPOCH" ]]; then
+    elif [[ "$EXP_DATE" != "never" && -n "$EXP_DATE" ]]; then
+        EXP_EPOCH=$(date -d "$EXP_DATE" +%s 2>/dev/null)
+        if [[ -n "$EXP_EPOCH" && "$EXP_EPOCH" -lt $(date +%s) ]]; then
             STATUS="WYGASŁE"
-        else
-            STATUS="AKTYWNE"
         fi
-    else
-        # Jeśli nie ma w shadow i nie ma daty wygaśnięcia, a jest w getent - uznajemy za aktywne (np. AD)
-        STATUS="AKTYWNE"
     fi
 
-    # Ostatnie logowanie
     LAST_LOG=$(lastlog -u "$user" | tail -n 1 | awk '{print $4,$5,$6,$9}')
-    [ -z "$LAST_LOG" ] || [[ "$LAST_LOG" == *"Never"* ]] && LAST_LOG="Nigdy"
+    [[ "$LAST_LOG" == *"Never"* || -z "$LAST_LOG" ]] && LAST_LOG="Nigdy"
 
-    printf "%-15s %-15s %-20s\n" "$user" "$STATUS" "$LAST_LOG"
+    printf "%-18s %-12s %-15s %-20s\n" "$user" "$uid" "$STATUS" "$LAST_LOG"
 done
 
-echo -e "\n[2. POLITYKI SYSTEMOWE]"
+echo -e "\n[2. POLITYKI HASEŁ I SKŁADNI (Complexity)]"
+echo "----------------------------------------------------------------"
+if [ -f /etc/security/pwquality.conf ]; then
+    echo "> Ustawienia z pwquality.conf:"
+    grep -E '^minlen|^dcredit|^ucredit|^lcredit|^ocredit|^minclass' /etc/security/pwquality.conf || echo "Brak jawnych wpisów (stosowane domyślne)."
+fi
+# Dodatkowy check w PAM dla starszych systemów lub specyficznych konfiguracji
+echo "> Ustawienia wymuszone w PAM (pam_pwquality/pam_cracklib):"
+grep -hE "pam_pwquality.so|pam_cracklib.so" /etc/pam.d/system-auth /etc/pam.d/password-auth | tr ' ' '\n' | grep -E 'minlen|retry|dcredit|ucredit|lcredit|ocredit'
 
-# Minimalna długość i składnia
-echo "--- Składnia haseł (pwquality) ---"
-[ -f /etc/security/pwquality.conf ] && grep -E '^minlen|^dcredit|^ucredit|^lcredit|^ocredit' /etc/security/pwquality.conf || echo "Domyślne systemowe"
+echo -e "\n[3. CZAS ŻYCIA HASŁA (Password Aging)]"
+echo "----------------------------------------------------------------"
+grep -E '^PASS_MAX_DAYS|^PASS_MIN_DAYS|^PASS_WARN_AGE' /etc/login.defs
 
-# Historia haseł
-echo -e "\n--- Historia haseł (pamiętanie) ---"
-grep -h "pam_pwhistory.so" /etc/pam.d/system-auth /etc/pam.d/password-auth | grep "remember" || echo "Brak ograniczeń historii"
+echo -e "\n[4. BLOKOWANIE KONTA PO NIEUDANYCH LOGOWANIACH (Account Lockout)]"
+echo "----------------------------------------------------------------"
+if [ -f /etc/security/faillock.conf ]; then
+    grep -E '^deny|^unlock_time|^even_deny_root' /etc/security/faillock.conf
+else
+    echo "> Parametry faillock bezpośrednio w PAM:"
+    grep -h "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/password-auth | tr ' ' '\n' | grep -E 'deny|unlock_time|even_deny_root' | sort -u
+fi
 
-# Blokada po błędach
-echo -e "\n--- Blokowanie kont (faillock) ---"
-[ -f /etc/security/faillock.conf ] && grep -E '^deny|^unlock_time' /etc/security/faillock.conf || echo "Konfiguracja w PAM"
+echo -e "\n[5. HISTORIA HASIEŁ (Password History)]"
+echo "----------------------------------------------------------------"
+grep -h "pam_pwhistory.so" /etc/pam.d/system-auth /etc/pam.d/password-auth | tr ' ' '\n' | grep "remember" | sort -u || echo "Historia haseł: Nieaktywowana (0)"
 
-# Szyfrowanie haseł
-echo -e "\n--- Szyfrowanie haseł ---"
-grep "^ENCRYPT_METHOD" /etc/login.defs || echo "Metoda: SHA512 (Standard RHEL)"
+echo -e "\n[6. SZYFROWANIE I TRANSMISJA]"
+echo "----------------------------------------------------------------"
+METHOD=$(grep "^ENCRYPT_METHOD" /etc/login.defs | awk '{print $2}')
+echo "Algorytm szyfrowania (login.defs): ${METHOD:-SHA512 (Standard)}"
+ID=$(grep '^root:' /etc/shadow | cut -d: -f2 | cut -c1-3)
+echo "Identyfikator hash w shadow: $ID ($([[ "$ID" == "\$6\$" ]] && echo "SHA-512" || echo "Inny/Starszy"))"
+echo "Logowanie Root przez SSH: $(grep "^PermitRootLogin" /etc/ssh/sshd_config | awk '{print $2}')"
 
-# Transmisja haseł
-echo -e "\n--- Bezpieczeństwo transmisji ---"
-echo "Status SSH: $(systemctl is-active sshd)"
-echo "Szyfrowanie sesji: Tak (wymuszone przez SSH)"
+echo -e "\n[7. WYMUSZENIE ZMIANY HASŁA]"
+echo "----------------------------------------------------------------"
+echo "Użytkownicy z wymuszoną zmianą przy następnym logowaniu:"
+awk -F: '$3 == 0 {print "- " $1}' /etc/shadow
 
 echo -e "\n================================================================"
+echo "KONIEC RAPORTU"
