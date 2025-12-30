@@ -100,6 +100,43 @@ send_to_ftp() {
     fi
 }
 
+# Funkcja do pakowania plików
+pack_logs() {
+    local source_dir="$1"
+    local timestamp=$(date '+%Y-%m-%d_%H-%M')
+    local archive_name="logs_${timestamp}.tar.gz"
+    local archive_path="${SCRIPT_DIR}/tmp/${archive_name}"
+    
+    echo "Pakowanie plików do archiwum: ${archive_name}"
+    echo "Ścieżka archiwum: ${archive_path}"
+    
+    # Utworzenie archiwum tar.gz
+    if tar -czf "${archive_path}" -C "${source_dir}" . ; then
+        echo "Archiwum utworzone pomyślnie: ${archive_path}"
+        echo "${archive_path}"  # Zwracanie ścieżki do archiwum
+    else
+        echo "Błąd podczas tworzenia archiwum!" >&2
+        return 1
+    fi
+}
+
+# Funkcja wysyłająca pojedynczy plik na FTP
+send_file_to_ftp() {
+    local local_file="$1"
+    local remote_dir="$2"
+    local filename=$(basename "${local_file}")
+
+    echo "Rozpoczęcie transferu FTP pliku: ${filename} -> ${remote_dir}"
+    lftp -c "set ftp:ssl-force true ; set ssl:verify-certificate no; set ftp:ssl-auth TLS; set ftp:ssl-protect-data yes; open -u ${FTP_USER},${FTP_PASS} ${FTP_HOST}; put -O \"${remote_dir}\" \"${local_file}\"; quit"
+
+    if [ $? -eq 0 ]; then
+        echo "Transfer FTP pliku ${filename} zakończony sukcesem"
+    else
+        echo "Błąd podczas transferu FTP pliku ${filename}!" >&2
+        return 1
+    fi
+}
+
 # Rejestracja trap dla sygnałów
 trap cleanup EXIT TERM INT
 
@@ -123,9 +160,26 @@ main() {
 
         echo "Kopiowanie plików do: ${TMP_LOGS_DIR}"
         cp -v --preserve=all ${RECENT_FILES} "${TMP_LOGS_DIR}"
+        
+        # Pakowanie plików
         echo "============================================"
-        echo "send to ftp: ${FTP_REMOTE_DIR}"
-        send_to_ftp "${TMP_LOGS_DIR}" "${FTP_REMOTE_DIR}"
+        echo "Pakowanie plików..."
+        local ARCHIVE_PATH
+        ARCHIVE_PATH=$(pack_logs "${TMP_LOGS_DIR}")
+        
+        if [ $? -eq 0 ] && [ -f "${ARCHIVE_PATH}" ]; then
+            echo "============================================"
+            echo "Wysyłanie archiwum na FTP: ${FTP_REMOTE_DIR}"
+            send_file_to_ftp "${ARCHIVE_PATH}" "${FTP_REMOTE_DIR}"
+            
+            # Usunięcie archiwum po udanej wysyłce
+            if [ $? -eq 0 ]; then
+                rm -f "${ARCHIVE_PATH}"
+                echo "Archiwum usunięte po pomyślnej wysyłce: $(basename "${ARCHIVE_PATH}")"
+            fi
+        else
+            echo "Błąd podczas pakowania - pomijanie wysyłki FTP"
+        fi
     else
         # Tryb pełnego mirrora
         echo "Wykonywanie pełnego mirrora katalogu: ${local_mirror_dir}"
