@@ -110,12 +110,26 @@ pack_logs() {
     echo "Pakowanie plików do archiwum: ${archive_name}"
     echo "Ścieżka archiwum: ${archive_path}"
     
+    # Sprawdź czy katalog źródłowy ma jakieś pliki
+    if [ -z "$(ls -A "${source_dir}" 2>/dev/null)" ]; then
+        echo "BŁĄD: Katalog źródłowy jest pusty: ${source_dir}" >&2
+        return 1
+    fi
+    
+    # Utworzenie katalogu tmp jeśli nie istnieje
+    mkdir -p "${SCRIPT_DIR}/tmp"
+    
     # Utworzenie archiwum tar.gz
-    if tar -czf "${archive_path}" -C "${source_dir}" . ; then
+    tar -czf "${archive_path}" -C "${source_dir}" .
+    local tar_exit_code=$?
+    
+    if [ ${tar_exit_code} -eq 0 ]; then
         echo "Archiwum utworzone pomyślnie: ${archive_path}"
-        echo "${archive_path}"  # Zwracanie ścieżki do archiwum
+        # Wypisz ścieżkę do oddzielnego deskryptora plików
+        echo "${archive_path}" >&3
+        return 0
     else
-        echo "Błąd podczas tworzenia archiwum!" >&2
+        echo "Błąd podczas tworzenia archiwum! Kod wyjścia tar: ${tar_exit_code}" >&2
         return 1
     fi
 }
@@ -160,25 +174,45 @@ main() {
 
         echo "Kopiowanie plików do: ${TMP_LOGS_DIR}"
         cp -v --preserve=all ${RECENT_FILES} "${TMP_LOGS_DIR}"
+        local cp_exit_code=$?
         
-        # Pakowanie plików
+        if [ ${cp_exit_code} -ne 0 ]; then
+            echo "BŁĄD podczas kopiowania plików! Kod wyjścia: ${cp_exit_code}" >&2
+            exit 1
+        fi
+        
+        # Pakowanie plików - rozdzielone
         echo "============================================"
         echo "Pakowanie plików..."
-        local ARCHIVE_PATH
-        ARCHIVE_PATH=$(pack_logs "${TMP_LOGS_DIR}")
         
-        if [ $? -eq 0 ] && [ -f "${ARCHIVE_PATH}" ]; then
+        # Używamy deskryptora 3 do otrzymania ścieżki archiwum
+        local ARCHIVE_PATH
+        exec 3>&1
+        pack_logs "${TMP_LOGS_DIR}"
+        local pack_exit_code=$?
+        ARCHIVE_PATH=$(pack_logs "${TMP_LOGS_DIR}" 3>&1 1>/dev/null)
+        exec 3>&-
+        
+        echo "Kod wyjścia pakowania: ${pack_exit_code}"
+        echo "Ścieżka archiwum: '${ARCHIVE_PATH}'"
+        
+        if [ ${pack_exit_code} -eq 0 ] && [ -f "${ARCHIVE_PATH}" ]; then
             echo "============================================"
             echo "Wysyłanie archiwum na FTP: ${FTP_REMOTE_DIR}"
             send_file_to_ftp "${ARCHIVE_PATH}" "${FTP_REMOTE_DIR}"
+            local ftp_exit_code=$?
             
             # Usunięcie archiwum po udanej wysyłce
-            if [ $? -eq 0 ]; then
+            if [ ${ftp_exit_code} -eq 0 ]; then
                 rm -f "${ARCHIVE_PATH}"
                 echo "Archiwum usunięte po pomyślnej wysyłce: $(basename "${ARCHIVE_PATH}")"
+            else
+                echo "BŁĄD FTP - archiwum pozostawione: ${ARCHIVE_PATH}"
             fi
         else
             echo "Błąd podczas pakowania - pomijanie wysyłki FTP"
+            echo "pack_exit_code: ${pack_exit_code}"
+            echo "Archiwum istnieje: $([ -f "${ARCHIVE_PATH}" ] && echo "TAK" || echo "NIE")"
         fi
     else
         # Tryb pełnego mirrora
