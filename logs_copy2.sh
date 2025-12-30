@@ -40,7 +40,7 @@ CLEANUP_SAFE=false
 
 # Konfiguracja FTP
 FTP_HOST="ftp.chujumuju.pl"
-FTP_USER="SGBLOG"
+FTP_USER="LOG"
 FTP_PASS='******'
 FTP_REMOTE_DIR="/ZDALNY/"
 FTP_PARALLEL=5
