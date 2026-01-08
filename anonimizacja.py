@@ -6,7 +6,7 @@ import sys
 
 class LogAnonymizer:
     def __init__(self):
-        # Słownik do przechowywania mapowań: oryginał -> stały ID
+        # Słownik: kategoria -> { oryginalna_wartosc: identyfikator }
         self.mappings = {'ip_address': {}, 'pv_volume': {}, 'dns_name': {}}
         
         self.patterns = {
@@ -26,6 +26,18 @@ class LogAnonymizer:
         for cat, pat in self.patterns.items():
             text = re.sub(pat, lambda m: self._get_consistent_id(m.group(0), cat), text)
         return text
+
+    def save_mapping(self, output_dir):
+        """Zapisuje klucz anonimizacji do pliku JSON"""
+        mapping_path = os.path.join(output_dir, "mapping_key.json")
+        with open(mapping_path, 'w', encoding='utf-8') as f:
+            # Odwracamy słownik dla łatwiejszego czytania: ID -> Oryginał
+            readable_mapping = {
+                cat: {v: k for k, v in values.items()} 
+                for cat, values in self.mappings.items()
+            }
+            json.dump(readable_mapping, f, indent=4)
+        return mapping_path
 
     def process_file(self, in_p, out_p):
         _, ext = os.path.splitext(in_p)
@@ -51,10 +63,11 @@ class LogAnonymizer:
 
 def main():
     if len(sys.argv) < 2:
-        print("Użycie: python anonymize.py <sciezka_do_katalogu>")
+        print("Użycie: python anonymizer_pro.py <katalog> [<fraza_w_nazwie_pliku>]")
         return
 
     input_dir = sys.argv[1].rstrip(os.sep)
+    file_filter = sys.argv[2] if len(sys.argv) > 2 else None
     output_dir = f"{input_dir}_OUT"
     
     if not os.path.isdir(input_dir):
@@ -63,20 +76,30 @@ def main():
 
     anonymizer = LogAnonymizer()
     print(f"[*] Rozpoczynam anonimizację...")
-    print(f"[*] Źródło: {input_dir}")
-    print(f"[*] Cel:    {output_dir}\n")
+    print(f"[*] Cel: {output_dir}")
+    if file_filter:
+        print(f"[*] Filtr nazw plików: '{file_filter}' (będą anonimizowane)")
 
     for root, _, files in os.walk(input_dir):
-        for file in files:
-            in_path = os.path.join(root, file)
-            rel_path = os.path.relpath(in_path, input_dir)
-            out_path = os.path.join(output_dir, rel_path)
+        for file_name in files:
+            in_path = os.path.join(root, file_name)
+            
+            # Anonimizacja samej nazwy pliku, jeśli zawiera frazę
+            target_name = file_name
+            if file_filter and file_filter in file_name:
+                target_name = anonymizer.mask_text(file_name)
+            
+            rel_path = os.path.relpath(root, input_dir)
+            out_path = os.path.join(output_dir, rel_path, target_name)
             
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            print(f"  -> Przetwarzam: {rel_path}")
+            print(f"  -> {file_name} " + (f"-> {target_name}" if target_name != file_name else ""))
             anonymizer.process_file(in_path, out_path)
 
-    print(f"\n[V] Gotowe! Pliki zapisano w: {output_dir}")
+    # Zapisanie mapowania
+    m_path = anonymizer.save_mapping(output_dir)
+    print(f"\n[V] Gotowe!")
+    print(f"[i] Klucz dekodujący zapisano w: {m_path}")
 
 if __name__ == "__main__":
     main()
