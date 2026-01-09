@@ -3,6 +3,8 @@ import json
 import os
 import hashlib
 import sys
+from datetime import datetime
+import tempfile
 
 class LogAnonymizer:
     def __init__(self):
@@ -27,11 +29,18 @@ class LogAnonymizer:
             text = re.sub(pat, lambda m: self._get_consistent_id(m.group(0), cat), text)
         return text
 
-    def save_mapping(self, output_dir):
-        """Zapisuje klucz anonimizacji do pliku JSON"""
-        mapping_path = os.path.join(output_dir, "mapping_key.json")
+    def save_mapping_to_tmp(self):
+        """Zapisuje klucz anonimizacji do katalogu /tmp"""
+        # Generowanie unikalnej nazwy pliku z timestampem
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"anonymization_key_{ts}.json"
+        
+        # Używamy tempfile.gettempdir() dla kompatybilności (Linux: /tmp, Windows: Temp)
+        tmp_dir = tempfile.gettempdir()
+        mapping_path = os.path.join(tmp_dir, filename)
+        
         with open(mapping_path, 'w', encoding='utf-8') as f:
-            # Odwracamy słownik dla łatwiejszego czytania: ID -> Oryginał
+            # Odwracamy słownik: ID -> Oryginał dla łatwego odczytu
             readable_mapping = {
                 cat: {v: k for k, v in values.items()} 
                 for cat, values in self.mappings.items()
@@ -75,16 +84,14 @@ def main():
         return
 
     anonymizer = LogAnonymizer()
-    print(f"[*] Rozpoczynam anonimizację...")
-    print(f"[*] Cel: {output_dir}")
-    if file_filter:
-        print(f"[*] Filtr nazw plików: '{file_filter}' (będą anonimizowane)")
+    print(f"[*] Rozpoczynam proces...")
+    print(f"[*] Pliki wynikowe trafią do: {output_dir}")
 
     for root, _, files in os.walk(input_dir):
         for file_name in files:
             in_path = os.path.join(root, file_name)
             
-            # Anonimizacja samej nazwy pliku, jeśli zawiera frazę
+            # Decyzja o anonimizacji nazwy pliku
             target_name = file_name
             if file_filter and file_filter in file_name:
                 target_name = anonymizer.mask_text(file_name)
@@ -93,13 +100,16 @@ def main():
             out_path = os.path.join(output_dir, rel_path, target_name)
             
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            print(f"  -> {file_name} " + (f"-> {target_name}" if target_name != file_name else ""))
+            print(f"  -> Przetwarzam: {file_name}")
             anonymizer.process_file(in_path, out_path)
 
-    # Zapisanie mapowania
-    m_path = anonymizer.save_mapping(output_dir)
-    print(f"\n[V] Gotowe!")
-    print(f"[i] Klucz dekodujący zapisano w: {m_path}")
+    # Zapisanie klucza w bezpiecznym miejscu (/tmp)
+    key_file = anonymizer.save_mapping_to_tmp()
+    
+    print("-" * 40)
+    print(f"[V] Anonimizacja zakończona sukcesem.")
+    print(f"[!] KLUCZ DEKODUJĄCY: {key_file}")
+    print(f"[i] Pamiętaj, aby zabezpieczyć ten plik!")
 
 if __name__ == "__main__":
     main()
