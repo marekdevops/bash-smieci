@@ -25,32 +25,39 @@ class TargetedAnonymizer:
         return self.mappings[cat][val]
 
     def anonymize_text(self, text):
-        """Główna funkcja zamieniająca wrażliwe dane na ID."""
         if not isinstance(text, str):
             return text
         
-        # 1. Anonimizacja wolumenów pv_* (zawsze)
+        # 1. PV (zawsze)
         text = re.sub(self.pv_pattern, lambda m: self._get_id(m.group(0), 'pv'), text)
         
-        # 2. Anonimizacja IP z zadanym prefixem (np. 10.10.x.x)
+        # 2. IP z prefixem
         if self.ip_prefix:
             safe_prefix = self.ip_prefix.replace('.', r'\.')
-            # Szuka prefixu i dwóch kolejnych oktetów adresu IP
             ip_pattern = rf'\b({safe_prefix}\.\d{{1,3}}\.\d{{1,3}})\b'
             text = re.sub(ip_pattern, lambda m: self._get_id(m.group(1), 'ip'), text)
             
-        # 3. Anonimizacja DNS zawierającego frazę (odporna na separatory)
+        # 3. DNS (odporny na kropki ORAZ myślniki)
         if self.dns_filter:
-            # Szukamy hosta/domeny zawierającej filtr, dopuszczając litery, cyfry, kropki i myślniki.
-            # Używamy lookahead/lookbehind lub granic słów, aby nie "pożreć" znaków specjalnych za domeną.
-            dns_pattern = rf'([a-zA-Z0-9.-]*{re.escape(self.dns_filter)}[a-zA-Z0-9]*)'
+            # Tworzymy wersję filtra z myślnikami (np. moja-domena-pl)
+            dns_hyphenated = self.dns_filter.replace('.', '-')
+            
+            # Budujemy regex, który szuka OBU wariantów
+            # Szukamy ciągu alfanumerycznego, który zawiera kropki LUB myślniki
+            combined_filter = f"({re.escape(self.dns_filter)}|{re.escape(dns_hyphenated)})"
+            dns_pattern = rf'([a-zA-Z0-9.-]*{combined_filter}[a-zA-Z0-9]*)'
             
             def dns_replacer(match):
                 full_match = match.group(1)
-                # Czyścimy z kropek/myślników na końcach (np. jeśli kropka była końcem zdania)
                 clean_dns = full_match.strip('.-')
                 suffix = full_match[len(clean_dns):]
-                return self._get_id(clean_dns, 'dns') + suffix
+                
+                # KLUCZ: Normalizujemy wartość przed pobraniem ID.
+                # Zamieniamy wszystkie myślniki na kropki, aby worker-domena-pl 
+                # i worker.domena.pl dostały TEN SAM hash.
+                normalized_val = clean_dns.replace('-', '.')
+                
+                return self._get_id(normalized_val, 'dns') + suffix
 
             text = re.sub(dns_pattern, dns_replacer, text)
             
