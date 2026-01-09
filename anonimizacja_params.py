@@ -10,99 +10,131 @@ class TargetedAnonymizer:
     def __init__(self, dns_filter=None, ip_prefix=None):
         self.dns_filter = dns_filter
         self.ip_prefix = ip_prefix
+        # Słownik przechowujący mapowania: oryginał -> ID
         self.mappings = {'ip': {}, 'dns': {}, 'pv': {}}
         
-        # Stały wzorzec dla pv_ (zgodnie z pierwotnym założeniem)
+        # Stały wzorzec dla wolumenów pv_*
         self.pv_pattern = r'\bpv_[a-zA-Z0-9_\-]+\b'
 
     def _get_id(self, val, cat):
+        """Generuje stały identyfikator dla danej wartości w danej kategorii."""
+        val = val.lower().strip()
         if val not in self.mappings[cat]:
             short_hash = hashlib.md5(val.encode()).hexdigest()[:6]
             self.mappings[cat][val] = f"[{cat.upper()}_{short_hash}]"
         return self.mappings[cat][val]
 
     def anonymize_text(self, text):
-        if not isinstance(text, str): return text
+        """Główna funkcja zamieniająca wrażliwe dane na ID."""
+        if not isinstance(text, str):
+            return text
         
-        # 1. Anonimizacja PV (zawsze)
+        # 1. Anonimizacja wolumenów pv_* (zawsze)
         text = re.sub(self.pv_pattern, lambda m: self._get_id(m.group(0), 'pv'), text)
         
-        # 2. Anonimizacja IP z prefixem (np. 10.10.X.X)
+        # 2. Anonimizacja IP z zadanym prefixem (np. 10.10.x.x)
         if self.ip_prefix:
-            # Escapujemy kropki w prefixie dla regex
             safe_prefix = self.ip_prefix.replace('.', r'\.')
-            ip_pattern = rf'\b{safe_prefix}\.\d{{1,3}}\.\d{{1,3}}\b'
-            text = re.sub(ip_pattern, lambda m: self._get_id(m.group(0), 'ip'), text)
+            # Szuka prefixu i dwóch kolejnych oktetów adresu IP
+            ip_pattern = rf'\b({safe_prefix}\.\d{{1,3}}\.\d{{1,3}})\b'
+            text = re.sub(ip_pattern, lambda m: self._get_id(m.group(1), 'ip'), text)
             
-        # 3. Anonimizacja DNS zawierającego frazę
+        # 3. Anonimizacja DNS zawierającego frazę (odporna na separatory)
         if self.dns_filter:
-            # Szuka ciągów znaków przypominających hosty/domeny zawierające filtr
-            dns_pattern = rf'\b[a-zA-Z0-9.-]*{re.escape(self.dns_filter)}[a-zA-Z0-9.-]*\b'
-            text = re.sub(dns_pattern, lambda m: self._get_id(m.group(0), 'dns'), text)
+            # Szukamy hosta/domeny zawierającej filtr, dopuszczając litery, cyfry, kropki i myślniki.
+            # Używamy lookahead/lookbehind lub granic słów, aby nie "pożreć" znaków specjalnych za domeną.
+            dns_pattern = rf'([a-zA-Z0-9.-]*{re.escape(self.dns_filter)}[a-zA-Z0-9]*)'
+            
+            def dns_replacer(match):
+                full_match = match.group(1)
+                # Czyścimy z kropek/myślników na końcach (np. jeśli kropka była końcem zdania)
+                clean_dns = full_match.strip('.-')
+                suffix = full_match[len(clean_dns):]
+                return self._get_id(clean_dns, 'dns') + suffix
+
+            text = re.sub(dns_pattern, dns_replacer, text)
             
         return text
 
     def save_key(self):
+        """Zapisuje mapowanie do pliku JSON w katalogu tymczasowym systemu."""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(tempfile.gettempdir(), f"anonymizer_key_{ts}.json")
-        with open(path, 'w') as f:
-            json.dump(self.mappings, f, indent=4)
+        tmp_dir = tempfile.gettempdir()
+        path = os.path.join(tmp_dir, f"anonymizer_key_{ts}.json")
+        
+        # Przygotowanie czytelnego formatu: ID -> Oryginalna wartość
+        readable_map = {
+            cat: {v: k for k, v in res.items()} 
+            for cat, res in self.mappings.items()
+        }
+        
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(readable_map, f, indent=4)
         return path
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Targeted Log Anonymizer")
-    parser.add_argument("dir", help="Katalog wejściowy")
-    parser.add_argument("-dns", help="Fraza w nazwie DNS do zamaskowania (np. 'firma.local')")
-    parser.add_argument("-ip", help="Prefix IP do zamaskowania (np. '10.10')")
+    parser.add_argument("dir", help="Katalog z plikami do anonimizacji")
+    parser.add_argument("-dns", help="Fraza w nazwie DNS (np. 'moja.domena.pl')")
+    parser.add_argument("-ip", help="Prefix IP (np. '10.10')")
     
     args = parser.parse_args()
     
     if not os.path.isdir(args.dir):
-        print(f"Błąd: {args.dir} nie istnieje.")
+        print(f"Błąd: Katalog {args.dir} nie istnieje.")
         return
 
-    in_dir = args.dir.rstrip(os.sep)
-    out_dir = f"{in_dir}_OUT"
+    input_dir = args.dir.rstrip(os.sep)
+    output_dir = f"{input_dir}_OUT"
     anon = TargetedAnonymizer(dns_filter=args.dns, ip_prefix=args.ip)
 
-    print(f"[*] Start. Cel: {out_dir}")
+    print(f"[*] Rozpoczynam anonimizację katalogu: {input_dir}")
+    print(f"[*] Wyniki zostaną zapisane w: {output_dir}")
 
-    for root, _, files in os.walk(in_dir):
+    for root, _, files in os.walk(input_dir):
         for fname in files:
-            # Przetwarzanie nazwy pliku
+            # Anonimizacja nazwy pliku
             new_fname = anon.anonymize_text(fname)
             
-            in_p = os.path.join(root, fname)
-            rel = os.path.relpath(root, in_dir)
-            out_p = os.path.join(out_dir, rel, new_fname)
+            in_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(root, input_dir)
+            out_path = os.path.join(output_dir, rel_path, new_fname)
             
-            os.makedirs(os.path.dirname(out_p), exist_ok=True)
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
             
-            # Przetwarzanie zawartości
-            _, ext = os.path.splitext(fname)
-            with open(in_p, 'r', encoding='utf-8', errors='ignore') as f:
-                if ext.lower() == '.json':
+            try:
+                with open(in_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                    
+                # Obsługa formatu JSON
+                if fname.lower().endswith('.json'):
                     try:
-                        data = json.load(f)
-                        def walk_json(obj):
-                            if isinstance(obj, dict): return {k: walk_json(v) for k, v in obj.items()}
-                            if isinstance(obj, list): return [walk_json(i) for i in obj]
-                            return anon.anonymize_text(obj)
-                        res = walk_json(data)
-                        with open(out_p, 'w') as o: json.dump(res, o, indent=4)
-                    except: # Jeśli JSON jest uszkodzony, traktuj jak tekst
-                        f.seek(0)
-                        with open(out_p, 'w') as o:
-                            for line in f: o.write(anon.anonymize_text(line))
+                        data = json.loads(content)
+                        def walk(obj):
+                            if isinstance(obj, dict): return {k: walk(v) for k, v in obj.items()}
+                            if isinstance(obj, list): return [walk(i) for i in obj]
+                            if isinstance(obj, str): return anon.anonymize_text(obj)
+                            return obj
+                        
+                        processed_content = json.dumps(walk(data), indent=4)
+                    except:
+                        processed_content = anon.anonymize_text(content)
                 else:
-                    with open(out_p, 'w') as o:
-                        for line in f: o.write(anon.anonymize_text(line))
-            
-            print(f"  -> {fname}")
+                    processed_content = anon.anonymize_text(content)
+
+                with open(out_path, 'w', encoding='utf-8') as f:
+                    f.write(processed_content)
+                
+                print(f"  [OK] {fname} -> {new_fname}")
+            except Exception as e:
+                print(f"  [!] Błąd podczas przetwarzania {fname}: {e}")
 
     key_path = anon.save_key()
-    print(f"\n[V] Gotowe. Klucz w: {key_path}")
+    print("\n" + "="*50)
+    print(f"SUKCES! Pliki zanonimizowano w: {output_dir}")
+    print(f"KLUCZ DEKODUJĄCY ZAPISANO W: {key_path}")
+    print("="*50)
 
 if __name__ == "__main__":
     main()
