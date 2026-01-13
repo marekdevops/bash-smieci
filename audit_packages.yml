@@ -1,0 +1,78 @@
+---
+- name: Audyt zainstalowanych pakietów
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: true
+  vars_files:
+    - packages.yml
+
+  vars:
+    report_file: "/tmp/audit_report_{{ inventory_hostname }}_{{ ansible_date_time.date }}.txt"
+    local_report_dir: "{{ playbook_dir }}"
+
+  tasks:
+    - name: Sprawdź wersje pakietów (Debian/Ubuntu)
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}|${Version}|${Status}\n' {{ item }} 2>/dev/null || echo "{{ item }}|NIE ZAINSTALOWANY|unknown"
+      loop: "{{ packages }}"
+      register: package_versions_deb
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "Debian"
+
+    - name: Sprawdź wersje pakietów (RedHat/CentOS)
+      ansible.builtin.shell: |
+        rpm -q --queryformat '%{NAME}|%{VERSION}-%{RELEASE}|installed\n' {{ item }} 2>/dev/null || echo "{{ item }}|NIE ZAINSTALOWANY|unknown"
+      loop: "{{ packages }}"
+      register: package_versions_rpm
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "RedHat"
+
+    - name: Ustaw wyniki pakietów
+      ansible.builtin.set_fact:
+        package_results: "{{ package_versions_deb.results | default(package_versions_rpm.results) }}"
+
+    - name: Generuj raport na zdalnym hoście
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        mode: '0644'
+        content: |
+          ╔══════════════════════════════════════════════════════════════════════════════╗
+          ║                        RAPORT AUDYTU PAKIETÓW                                ║
+          ╠══════════════════════════════════════════════════════════════════════════════╣
+          ║  Host:         {{ inventory_hostname | center(60) }}║
+          ║  System:       {{ ansible_distribution ~ ' ' ~ ansible_distribution_version | center(60) }}║
+          ║  Kernel:       {{ ansible_kernel | center(60) }}║
+          ║  Data:         {{ ansible_date_time.date ~ ' ' ~ ansible_date_time.time | center(60) }}║
+          ╠══════════════════════════════════════════════════════════════════════════════╣
+          ║                           LISTA PAKIETÓW                                     ║
+          ╠══════════════════════════════════════════════════════════════════════════════╣
+          ║  {% for result in package_results %}
+          {% set parts = result.stdout.split('|') %}
+          {% set pkg_name = parts[0] | default('N/A') %}
+          {% set pkg_version = parts[1] | default('N/A') %}
+          {% set pkg_status = parts[2] | default('N/A') %}
+          {% if 'NIE ZAINSTALOWANY' in pkg_version %}
+          ║  [✗] {{ "%-20s" | format(pkg_name) }} {{ "%-40s" | format('NIE ZAINSTALOWANY') }}║
+          {% else %}
+          ║  [✓] {{ "%-20s" | format(pkg_name) }} {{ "%-40s" | format(pkg_version[:40]) }}║
+          {% endif %}
+          {% endfor %}
+          ╠══════════════════════════════════════════════════════════════════════════════╣
+          ║  Podsumowanie:                                                               ║
+          ║  - Sprawdzonych pakietów: {{ packages | length | string | center(51) }}║
+          ╚══════════════════════════════════════════════════════════════════════════════╝
+
+    - name: Wyświetl lokalizację raportu
+      ansible.builtin.debug:
+        msg: "Raport zapisany: {{ report_file }}"
+
+    - name: Pobierz raport na lokalny serwer
+      ansible.builtin.fetch:
+        src: "{{ report_file }}"
+        dest: "{{ local_report_dir }}/reports/"
+        flat: false
+
+    - name: Informacja o pobranym raporcie
+      ansible.builtin.debug:
+        msg: "Raport skopiowany do: {{ local_report_dir }}/reports/{{ inventory_hostname }}{{ report_file }}"

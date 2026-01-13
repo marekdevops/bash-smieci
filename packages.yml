@@ -1,0 +1,12 @@
+# Lista pakietów do audytu
+packages:
+  - bash
+  - openssl
+  - openssh-server
+  - python3
+  - sudo
+  - curl
+  - wget
+  - vim
+  - git
+  - nginx
