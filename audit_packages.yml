@@ -28,40 +28,21 @@
       failed_when: false
       when: ansible_os_family == "RedHat"
 
-    - name: Ustaw wyniki pakietów
+    - name: Ustaw wyniki pakietów (Debian)
       ansible.builtin.set_fact:
-        package_results: "{{ package_versions_deb.results | default(package_versions_rpm.results) }}"
+        package_results: "{{ package_versions_deb.results }}"
+      when: ansible_os_family == "Debian"
+
+    - name: Ustaw wyniki pakietów (RedHat)
+      ansible.builtin.set_fact:
+        package_results: "{{ package_versions_rpm.results }}"
+      when: ansible_os_family == "RedHat"
 
     - name: Generuj raport na zdalnym hoście
-      ansible.builtin.copy:
+      ansible.builtin.template:
+        src: templates/report.j2
         dest: "{{ report_file }}"
         mode: '0644'
-        content: |
-          ╔══════════════════════════════════════════════════════════════════════════════╗
-          ║                        RAPORT AUDYTU PAKIETÓW                                ║
-          ╠══════════════════════════════════════════════════════════════════════════════╣
-          ║  Host:         {{ inventory_hostname | center(60) }}║
-          ║  System:       {{ ansible_distribution ~ ' ' ~ ansible_distribution_version | center(60) }}║
-          ║  Kernel:       {{ ansible_kernel | center(60) }}║
-          ║  Data:         {{ ansible_date_time.date ~ ' ' ~ ansible_date_time.time | center(60) }}║
-          ╠══════════════════════════════════════════════════════════════════════════════╣
-          ║                           LISTA PAKIETÓW                                     ║
-          ╠══════════════════════════════════════════════════════════════════════════════╣
-          ║  {% for result in package_results %}
-          {% set parts = result.stdout.split('|') %}
-          {% set pkg_name = parts[0] | default('N/A') %}
-          {% set pkg_version = parts[1] | default('N/A') %}
-          {% set pkg_status = parts[2] | default('N/A') %}
-          {% if 'NIE ZAINSTALOWANY' in pkg_version %}
-          ║  [✗] {{ "%-20s" | format(pkg_name) }} {{ "%-40s" | format('NIE ZAINSTALOWANY') }}║
-          {% else %}
-          ║  [✓] {{ "%-20s" | format(pkg_name) }} {{ "%-40s" | format(pkg_version[:40]) }}║
-          {% endif %}
-          {% endfor %}
-          ╠══════════════════════════════════════════════════════════════════════════════╣
-          ║  Podsumowanie:                                                               ║
-          ║  - Sprawdzonych pakietów: {{ packages | length | string | center(51) }}║
-          ╚══════════════════════════════════════════════════════════════════════════════╝
 
     - name: Wyświetl lokalizację raportu
       ansible.builtin.debug:

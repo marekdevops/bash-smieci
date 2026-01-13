@@ -1,0 +1,26 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        RAPORT AUDYTU PAKIETÓW                                ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Host:         {{ inventory_hostname.ljust(60) }}║
+║  System:       {{ (ansible_distribution ~ ' ' ~ ansible_distribution_version).ljust(60) }}║
+║  Kernel:       {{ ansible_kernel.ljust(60) }}║
+║  Data:         {{ (ansible_date_time.date ~ ' ' ~ ansible_date_time.time).ljust(60) }}║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                           LISTA PAKIETÓW                                     ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+{% for result in package_results %}
+{% set parts = result.stdout.split('|') %}
+{% set pkg_name = parts[0] %}
+{% set pkg_version = parts[1] %}
+{% if 'NIE ZAINSTALOWANY' in pkg_version %}
+║  [✗] {{ pkg_name.ljust(20) }} {{ 'NIE ZAINSTALOWANY'.ljust(40) }}║
+{% else %}
+║  [✓] {{ pkg_name.ljust(20) }} {{ pkg_version[:40].ljust(40) }}║
+{% endif %}
+{% endfor %}
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Podsumowanie:                                                               ║
+║  - Sprawdzonych pakietów: {{ (packages | length | string).center(51) }}║
+║  - Zainstalowanych:       {{ (package_results | selectattr('stdout', 'search', 'install') | list | length | string).center(51) }}║
+║  - Brakujących:           {{ (package_results | selectattr('stdout', 'search', 'NIE ZAINSTALOWANY') | list | length | string).center(51) }}║
+╚══════════════════════════════════════════════════════════════════════════════╝
