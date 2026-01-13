@@ -28,7 +28,7 @@ while IFS=: read -r user x uid gid desc home shell; do
 
         # 1. SPRAWDZENIE BLOKADY KONTA (BEZWZGLĘDNE)
         # Jeśli konto wygasło (data w shadow)
-        if [ -n "$expire_field" ]; then
+        if [ -n "$expire_field" ]; th
             today_epoch=$(($(date +%s) / 86400))
             if [ "$expire_field" -le "$today_epoch" ]; then
                 STATUS="Wygasłe"
