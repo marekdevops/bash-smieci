@@ -6,37 +6,45 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-TARGET_USER=$1
+# Parametr wejściowy
+TARGET_NAME=$1
 
-if [ -z "$TARGET_USER" ]; then
-    echo -e "${RED}Błąd: Nie podano nazwy użytkownika.${NC}"
-    echo "Użycie: sudo $0 <nazwa_użytkownika>"
+if [ -z "$TARGET_NAME" ]; then
+    echo -e "${RED}Błąd: Nie podano nazwy (użytkownika/grupy).${NC}"
+    echo "Użycie: sudo $0 <nazwa_użytkownika_i_grupy>"
     exit 1
 fi
 
-# Sprawdzenie czy użytkownik istnieje
-if ! id "$TARGET_USER" >/dev/null 2>&1; then
-    echo -e "${RED}Błąd: Użytkownik '$TARGET_USER' nie istnieje w systemie.${NC}"
+# Sprawdzenie czy użytkownik i grupa istnieją
+USER_EXISTS=false
+GROUP_EXISTS=false
+
+if id "$TARGET_NAME" >/dev/null 2>&1; then USER_EXISTS=true; fi
+if getent group "$TARGET_NAME" >/dev/null 2>&1; then GROUP_EXISTS=true; fi
+
+echo "=========================================================="
+echo " Raport Audytu Uprawnień GitLab dla Tożsamości: $TARGET_NAME"
+echo " Użytkownik: $([ "$USER_EXISTS" = true ] && echo -e "${GREEN}ISTNIEJE${NC}" || echo -e "${RED}BRAK${NC}")"
+echo " Grupa:      $([ "$GROUP_EXISTS" = true ] && echo -e "${GREEN}ISTNIEJE${NC}" || echo -e "${RED}BRAK${NC}")"
+echo " Data:       $(date)"
+echo "=========================================================="
+
+if [ "$USER_EXISTS" = false ]; then
+    echo -e "${RED}Przerwano: Użytkownik nie istnieje. Dalszy audyt niemożliwy.${NC}"
     exit 1
 fi
 
-echo "=========================================================="
-echo " Raport Audytu Uprawnień GitLab dla: $TARGET_USER"
-echo " Data: $(date)"
-echo "=========================================================="
-
-# 1. Sprawdzenie członkostwa w grupach
-echo -e "\n[1] Grupy użytkownika:"
-GROUPS=$(id "$TARGET_USER")
-if [[ $GROUPS == *"git-admins"* ]]; then
-    echo -e "  - Członkostwo w git-admins: ${GREEN}TAK${NC}"
+# 1. Sprawdzenie członkostwa w grupie
+echo -e "\n[1] Sprawdzenie powiązania użytkownik-grupa:"
+if id -nG "$TARGET_NAME" | grep -qw "$TARGET_NAME"; then
+    echo -e "  - Użytkownik '$TARGET_NAME' należy do grupy '$TARGET_NAME': ${GREEN}TAK${NC}"
 else
-    echo -e "  - Członkostwo w git-admins: ${YELLOW}NIE (Zalecane dla porządku)${NC}"
+    echo -e "  - Użytkownik '$TARGET_NAME' należy do grupy '$TARGET_NAME': ${RED}NIE${NC}"
 fi
 
-# 2. Sprawdzenie Sudoers (kluczowy punkt)
-echo -e "\n[2] Możliwości SUDO (komendy gitlab-ctl):"
-SUDO_L=$(sudo -l -U "$TARGET_USER" 2>/dev/null)
+# 2. Sprawdzenie Sudoers (na poziomie użytkownika)
+echo -e "\n[2] Możliwości SUDO (czy użytkownik/grupa może zarządzać GitLabem):"
+SUDO_L=$(sudo -l -U "$TARGET_NAME" 2>/dev/null)
 
 check_sudo_cmd() {
     if echo "$SUDO_L" | grep -E "$1" > /dev/null; then
@@ -46,49 +54,46 @@ check_sudo_cmd() {
     fi
 }
 
-check_sudo_cmd "gitlab-ctl status" "Status usług (status)"
-check_sudo_cmd "gitlab-ctl restart" "Restart usług (restart)"
-check_sudo_cmd "gitlab-ctl tail" "Podgląd logów (tail)"
+check_sudo_cmd "gitlab-ctl status" "Status (status)"
+check_sudo_cmd "gitlab-ctl (restart|stop|start)" "Zarządzanie procesami (restart/stop/start)"
+check_sudo_cmd "gitlab-ctl tail" "Podgląd logów na żywo (tail)"
 check_sudo_cmd "gitlab-ctl reconfigure" "Rekonfiguracja (reconfigure)"
-check_sudo_cmd "dnf (update|install) gitlab-ee" "Aktualizacja pakietu (dnf)"
+check_sudo_cmd "dnf (update|install) gitlab-ee" "Uprawnienia do aktualizacji pakietu"
 
-# 3. Sprawdzenie dostępu do plików i logów
-echo -e "\n[3] Uprawnienia do systemów plików (ACL/Unix):"
+# 3. Sprawdzenie uprawnień do plików przez ACL dla GRUPY
+echo -e "\n[3] Uprawnienia systemowe (ACL dla grupy '$TARGET_NAME'):"
 
-check_path_read() {
-    if sudo -u "$TARGET_USER" [ -r "$1" ]; then
-        echo -e "  - Odczyt $1: ${GREEN}TAK${NC}"
+check_acl() {
+    local PATH_TO_CHECK=$1
+    if getfacl -p "$PATH_TO_CHECK" 2>/dev/null | grep -q "group:$TARGET_NAME:r"; then
+        echo -e "  - Grupa ma dostęp (r) do $PATH_TO_CHECK: ${GREEN}TAK${NC}"
     else
-        echo -e "  - Odczyt $1: ${RED}NIE${NC}"
+        # Sprawdzenie czy grupa jest właścicielem jeśli nie ma ACL
+        if [ "$(stat -c '%G' "$PATH_TO_CHECK")" == "$TARGET_NAME" ]; then
+            echo -e "  - Grupa jest właścicielem $PATH_TO_CHECK: ${GREEN}TAK${NC}"
+        else
+            echo -e "  - Grupa ma dostęp do $PATH_TO_CHECK: ${RED}NIE${NC}"
+        fi
     fi
 }
 
-check_path_write() {
-    if sudo -u "$TARGET_USER" [ -w "$1" ]; then
-        echo -e "  - Zapis $1: ${GREEN}TAK${NC}"
-    else
-        echo -e "  - Zapis $1: ${YELLOW}NIE (Tylko jeśli zespół ma edytować config)${NC}"
-    fi
-}
+check_acl "/var/log/gitlab"
+check_acl "/etc/gitlab/gitlab.rb"
 
-check_path_read "/var/log/gitlab"
-check_path_read "/etc/gitlab/gitlab.rb"
-check_path_write "/etc/gitlab/gitlab.rb"
-
-# 4. Sprawdzenie środowiska (PATH)
-echo -e "\n[4] Środowisko wykonawcze:"
-if sudo -u "$TARGET_USER" which gitlab-ctl > /dev/null 2>&1; then
-    echo -e "  - gitlab-ctl w PATH: ${GREEN}TAK${NC}"
+# 4. Sprawdzenie możliwości zapisu do configu (istotne przy reconfigure)
+if [ -w "/etc/gitlab/gitlab.rb" ] && [ "$(stat -c '%G' /etc/gitlab/gitlab.rb)" == "$TARGET_NAME" ]; then
+     echo -e "  - Możliwość edycji gitlab.rb przez grupę: ${GREEN}TAK${NC}"
 else
-    echo -e "  - gitlab-ctl w PATH: ${RED}NIE (Może wymagać pełnej ścieżki /usr/bin/)${NC}"
+     echo -e "  - Możliwość edycji gitlab.rb przez grupę: ${YELLOW}NIE (Tylko root)${NC}"
 fi
 
-# 5. SELinux (Kontekst RHEL)
-echo -e "\n[5] Bezpieczeństwo (SELinux):"
-SELINUX_STATE=$(getenforce)
-echo -e "  - Tryb SELinux: ${YELLOW}$SELINUX_STATE${NC}"
-if [ "$SELINUX_STATE" == "Enforcing" ]; then
-    echo "    (Upewnij się, że nie ma blokad w /var/log/audit/audit.log przy operacjach gitlab-ctl)"
+# 5. Podsumowanie środowiska
+echo -e "\n[4] Środowisko wykonawcze RHEL:"
+echo -e "  - SELinux status: $(getenforce)"
+if [ -f "/etc/gitlab/gitlab-secrets.json" ]; then
+    if sudo -u "$TARGET_NAME" [ ! -r "/etc/gitlab/gitlab-secrets.json" ]; then
+        echo -e "  - ${YELLOW}Uwaga:${NC} Użytkownik nie może czytać gitlab-secrets.json. Może to utrudnić niektóre zadania rake."
+    fi
 fi
 
 echo -e "\n=========================================================="
