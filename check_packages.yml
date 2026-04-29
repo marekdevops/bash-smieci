@@ -1,0 +1,55 @@
+---
+- name: Audyt wersji Python - Wymagana wersja > 3.9
+  hosts: all
+  gather_facts: no
+  vars:
+    threshold_version: "3.10"
+
+  tasks:
+    - name: Lokalizacja wszystkich binarek python3
+      shell: "find /usr/bin /usr/local/bin -executable -name 'python3*' -type f 2>/dev/null"
+      register: found_bins
+      failed_when: false
+
+    - name: Pobranie wersji dla każdej znalezionej binarki
+      shell: "{{ item }} --version 2>&1"
+      loop: "{{ found_bins.stdout_lines }}"
+      register: version_checks
+      when: found_bins.stdout_lines | length > 0
+      failed_when: false
+
+    - name: Przetwarzanie wyników i klasyfikacja
+      set_fact:
+        python_report: >-
+          {%- set results = [] -%}
+          {%- if version_checks.results is defined -%}
+            {%- for res in version_checks.results -%}
+              {%- if res.stdout is defined and res.stdout != "" -%}
+                {%- set v_full = res.stdout.split(' ')[1] | trim -%}
+                {%- set is_valid = v_full is version(threshold_version, '>') -%}
+                {%- set _ = results.append({'path': res.item, 'ver': v_full, 'ok': is_valid}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ results }}
+
+    - name: Wyświetlenie raportu zbiorczego
+      run_once: true
+      delegate_to: localhost
+      debug:
+        msg: |
+          ================================================================================
+          RAPORT ZGODNOŚCI INTERPRETERÓW PYTHON (Wymagana wersja > {{ threshold_version }})
+          ================================================================================
+          {% for host in ansible_play_hosts %}
+          HOST: {{ host }}
+          {% if hostvars[host]['python_report'] is defined and hostvars[host]['python_report'] | length > 0 %}
+          {% for item in hostvars[host]['python_report'] %}
+            {{ "[  OK  ]" if item.ok else "[STARY ]" }} -> Wersja: {{ "%-8s" | format(item.ver) }} | Sciezka: {{ item.path }}
+          {% endfor %}
+          {% else %}
+            [ BRAK ] -> Nie znaleziono żadnej binarki python3 w skanowanych ścieżkach.
+          {% endif %}
+          --------------------------------------------------------------------------------
+          {% endfor %}
+2
