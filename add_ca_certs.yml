@@ -9,6 +9,12 @@
 #   ansible-playbook -i inventory add_ca_certs.yml -K -e target=all           # wszystko z inventory
 #   ansible-playbook -i inventory add_ca_certs.yml -K -e force_ca_update=true # wymuś update-ca-trust
 #
+# Dry run (nic nie zmienia, pokazuje co by zmienił; --diff pokaże różnice w plikach):
+#   ansible-playbook -i inventory add_ca_certs.yml -K -C --diff
+# W dry runie known_hosts też nie jest modyfikowany - jeśli hosty mają zmienione klucze,
+# najpierw odśwież same klucze (bez -C), potem puść dry run:
+#   ansible-playbook -i inventory add_ca_certs.yml --tags known_hosts
+#
 # Domyślnie playbook działa na grupie "rhel_servers" (zmiana: -e target=<grupa|host|wzorzec>).
 #
 # Uwaga dot. RHEL 6: ma tylko Pythona 2.6, którego ansible-core >= 2.12 nie obsługuje,
@@ -52,12 +58,14 @@
         label: "{{ item.item }}"
 
     - name: Upewnienie się, że istnieje katalog ~/.ssh
+      tags: [known_hosts]
       ansible.builtin.file:
         path: "{{ known_hosts_file | dirname }}"
         state: directory
         mode: "0700"
 
     - name: Upewnienie się, że istnieje plik known_hosts
+      tags: [known_hosts]
       ansible.builtin.file:
         path: "{{ known_hosts_file }}"
         state: touch
@@ -69,28 +77,51 @@
     # stary wpis jest usuwany (ssh-keygen -R), a nowe klucze dopisywane.
     # Gdy klucze się zgadzają - nic nie jest zmieniane (zadanie idempotentne).
     - name: Odświeżenie kluczy hostów w known_hosts (usunięcie starych, dodanie nowych)
+      tags: [known_hosts]
+      # Sprawdzana jest nazwa hosta ORAZ jego adresy IP - przy CheckHostIP=yes ssh porównuje
+      # oba wpisy i przy starym kluczu dla IP pyta "Offending key for IP ... are you sure...",
+      # przez co Ansible zawiesza się na tym hoście (UNREACHABLE).
       ansible.builtin.shell: |
         set -o pipefail
         KH='{{ known_hosts_file }}'
         HOST='{{ ssh_host }}'
         PORT='{{ ssh_port }}'
-        if [ "$PORT" = "22" ]; then NAME="$HOST"; else NAME="[$HOST]:$PORT"; fi
+        DRY='{{ ansible_check_mode }}'
+        CHANGED_NAMES=""
 
-        NEW=$(ssh-keyscan -T 5 -p "$PORT" "$HOST" 2>/dev/null | grep -v '^#' | sort -u || true)
-        if [ -z "$NEW" ]; then
+        entry_name() { if [ "$PORT" = "22" ]; then echo "$1"; else echo "[$1]:$PORT"; fi; }
+
+        NEW_KEYS=$(ssh-keyscan -T 5 -p "$PORT" "$HOST" 2>/dev/null | grep -v '^#' | awk '{print $2" "$3}' | sort -u || true)
+        if [ -z "$NEW_KEYS" ]; then
           echo "NOSCAN"
           exit 0
         fi
 
-        OLD_KEYS=$(ssh-keygen -F "$NAME" -f "$KH" 2>/dev/null | grep -v '^#' | awk '{print $2" "$3}' | sort -u || true)
-        NEW_KEYS=$(echo "$NEW" | awk '{print $2" "$3}' | sort -u)
+        # $1 - nazwa/IP, $2 - czy dodać wpis, gdy go brak (yes/no)
+        refresh_entry() {
+          local name old
+          name=$(entry_name "$1")
+          old=$(ssh-keygen -F "$name" -f "$KH" 2>/dev/null | grep -v '^#' | awk '{print $2" "$3}' | sort -u || true)
+          [ "$old" = "$NEW_KEYS" ] && return 0
+          [ -z "$old" ] && [ "$2" = "no" ] && return 0
+          CHANGED_NAMES="$CHANGED_NAMES $name"
+          [ "$DRY" = "True" ] && return 0
+          ssh-keygen -R "$name" -f "$KH" >/dev/null 2>&1 || true
+          echo "$NEW_KEYS" | sed "s|^|$name |" >> "$KH"
+        }
 
-        if [ "$OLD_KEYS" = "$NEW_KEYS" ]; then
+        # Najpierw adresy IP (tylko gdy mają wpis z innym kluczem), na końcu nazwa hosta
+        for ip in $(getent ahosts "$HOST" 2>/dev/null | awk '{print $1}' | sort -u); do
+          [ "$ip" != "$HOST" ] && refresh_entry "$ip" no
+        done
+        refresh_entry "$HOST" yes
+
+        if [ -z "$CHANGED_NAMES" ]; then
           echo "OK"
+        elif [ "$DRY" = "True" ]; then
+          echo "CHANGED (dry run - known_hosts nie został zmieniony):$CHANGED_NAMES"
         else
-          ssh-keygen -R "$NAME" -f "$KH" >/dev/null 2>&1 || true
-          echo "$NEW" >> "$KH"
-          echo "CHANGED"
+          echo "CHANGED:$CHANGED_NAMES"
         fi
       args:
         executable: /bin/bash
@@ -101,8 +132,10 @@
       register: keyscan
       changed_when: "'CHANGED' in keyscan.stdout"
       failed_when: keyscan.rc != 0
+      check_mode: false   # w dry runie skrypt sam niczego nie zapisuje
 
     - name: Ostrzeżenie o hostach, z których nie udało się pobrać klucza SSH
+      tags: [known_hosts]
       ansible.builtin.debug:
         msg: "Nie udało się pobrać klucza SSH z {{ item.item }} - host może być nieosiągalny."
       loop: "{{ keyscan.results }}"
@@ -125,6 +158,7 @@
       ansible.builtin.raw: sed -n 's/.*release \([0-9]\+\).*/\1/p' /etc/redhat-release
       register: rhel_release
       changed_when: false
+      check_mode: false   # tylko odczyt - musi działać także w dry runie (-C)
 
     - name: Zapamiętanie wersji systemu
       ansible.builtin.set_fact:
@@ -185,6 +219,9 @@
             if [ -f "$DEST" ] && cmp -s "$TMP" "$DEST"; then
               rm -f "$TMP"
               echo "NOCHANGE"
+            elif [ "{{ ansible_check_mode }}" = "True" ]; then
+              rm -f "$TMP"
+              echo "CHANGED (dry run - plik nie został skopiowany)"
             else
               mv -f "$TMP" "$DEST"
               chown root:root "$DEST"
@@ -195,6 +232,7 @@
           loop: "{{ cert_files }}"
           register: rhel6_copy
           changed_when: "'CHANGED' in rhel6_copy.stdout"
+          check_mode: false   # w dry runie skrypt sam niczego nie zapisuje
 
         # Na RHEL 6 mechanizm ca-trust trzeba jednorazowo włączyć (update-ca-trust enable)
         - name: "RHEL 6: update-ca-trust enable + extract (raw)"
@@ -204,7 +242,9 @@
               exit 1
             fi
             update-ca-trust enable && update-ca-trust extract
-          when: rhel6_copy is changed or force_ca_update | bool
+          when:
+            - rhel6_copy is changed or force_ca_update | bool
+            - not ansible_check_mode
 
   handlers:
     # RHEL 7-10: update-ca-trust (p11-kit); zamiennik, gdyby skryptu nie było: trust extract-compat
