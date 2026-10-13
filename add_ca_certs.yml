@@ -1,0 +1,218 @@
+---
+# Dodanie certyfikatów CA do zaufanego magazynu systemu na RHEL 6/7/8/9/10.
+#
+# Uruchomienie (sudo z hasłem -> -K, bez hasła -> pomiń -K):
+#   ansible-playbook -i inventory add_ca_certs.yml -K
+#   ansible-playbook -i inventory add_ca_certs.yml -K -e target=web_servers
+#   ansible-playbook -i inventory add_ca_certs.yml -K -e target=srv1          # pojedynczy host
+#   ansible-playbook -i inventory add_ca_certs.yml -K -e target='srv1,srv2'   # lista hostów
+#   ansible-playbook -i inventory add_ca_certs.yml -K -e target=all           # wszystko z inventory
+#   ansible-playbook -i inventory add_ca_certs.yml -K -e force_ca_update=true # wymuś update-ca-trust
+#
+# Domyślnie playbook działa na grupie "rhel_servers" (zmiana: -e target=<grupa|host|wzorzec>).
+#
+# Uwaga dot. RHEL 6: ma tylko Pythona 2.6, którego ansible-core >= 2.12 nie obsługuje,
+# dlatego dla RHEL 6 cała operacja jest wykonywana modułem "raw" (bez Pythona na hoście).
+
+# =====================================================================
+# PLAY 1: kontroler - weryfikacja plików i odświeżenie ~/.ssh/known_hosts
+# =====================================================================
+- name: Przygotowanie kontrolera (pliki certyfikatów, known_hosts)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars: &cert_vars
+    # --- Certyfikaty do wgrania (ścieżki na serwerze, z którego uruchamiasz playbook) ---
+    cert_files:
+      - /home/marek/certs/root_ca.crt
+      - /home/marek/certs/intermediate_ca.crt
+
+    cert_dest_dir: /etc/pki/ca-trust/source/anchors
+    target_group: "{{ target | default('rhel_servers') }}"
+    # true = uruchom update-ca-trust nawet gdy certyfikaty na serwerze są już identyczne
+    force_ca_update: false
+    known_hosts_file: "{{ lookup('env', 'HOME') }}/.ssh/known_hosts"
+
+  tasks:
+    - name: Sprawdzenie czy pliki certyfikatów istnieją lokalnie
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ cert_files }}"
+      register: cert_stat
+
+    - name: Przerwanie, jeśli brakuje któregoś pliku
+      ansible.builtin.assert:
+        that: item.stat.exists and item.stat.isreg
+        fail_msg: "Brak pliku certyfikatu: {{ item.item }}"
+        quiet: true
+      loop: "{{ cert_stat.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Upewnienie się, że istnieje katalog ~/.ssh
+      ansible.builtin.file:
+        path: "{{ known_hosts_file | dirname }}"
+        state: directory
+        mode: "0700"
+
+    - name: Upewnienie się, że istnieje plik known_hosts
+      ansible.builtin.file:
+        path: "{{ known_hosts_file }}"
+        state: touch
+        mode: "0600"
+        modification_time: preserve
+        access_time: preserve
+
+    # Pobiera aktualne klucze hosta. Jeśli różnią się od zapisanych w known_hosts,
+    # stary wpis jest usuwany (ssh-keygen -R), a nowe klucze dopisywane.
+    # Gdy klucze się zgadzają - nic nie jest zmieniane (zadanie idempotentne).
+    - name: Odświeżenie kluczy hostów w known_hosts (usunięcie starych, dodanie nowych)
+      ansible.builtin.shell: |
+        set -o pipefail
+        KH='{{ known_hosts_file }}'
+        HOST='{{ ssh_host }}'
+        PORT='{{ ssh_port }}'
+        if [ "$PORT" = "22" ]; then NAME="$HOST"; else NAME="[$HOST]:$PORT"; fi
+
+        NEW=$(ssh-keyscan -T 5 -p "$PORT" "$HOST" 2>/dev/null | grep -v '^#' | sort -u || true)
+        if [ -z "$NEW" ]; then
+          echo "NOSCAN"
+          exit 0
+        fi
+
+        OLD_KEYS=$(ssh-keygen -F "$NAME" -f "$KH" 2>/dev/null | grep -v '^#' | awk '{print $2" "$3}' | sort -u || true)
+        NEW_KEYS=$(echo "$NEW" | awk '{print $2" "$3}' | sort -u)
+
+        if [ "$OLD_KEYS" = "$NEW_KEYS" ]; then
+          echo "OK"
+        else
+          ssh-keygen -R "$NAME" -f "$KH" >/dev/null 2>&1 || true
+          echo "$NEW" >> "$KH"
+          echo "CHANGED"
+        fi
+      args:
+        executable: /bin/bash
+      vars:
+        ssh_host: "{{ hostvars[item].ansible_host | default(item) }}"
+        ssh_port: "{{ hostvars[item].ansible_port | default(22) }}"
+      loop: "{{ query('ansible.builtin.inventory_hostnames', target_group) | difference(['localhost']) }}"
+      register: keyscan
+      changed_when: "'CHANGED' in keyscan.stdout"
+      failed_when: keyscan.rc != 0
+
+    - name: Ostrzeżenie o hostach, z których nie udało się pobrać klucza SSH
+      ansible.builtin.debug:
+        msg: "Nie udało się pobrać klucza SSH z {{ item.item }} - host może być nieosiągalny."
+      loop: "{{ keyscan.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: "'NOSCAN' in item.stdout"
+
+# =====================================================================
+# PLAY 2: serwery RHEL - kopiowanie certyfikatów i update-ca-trust
+# =====================================================================
+- name: Dodanie certyfikatów CA na serwerach RHEL 6-10
+  hosts: "{{ target | default('rhel_servers') }}"
+  become: true
+  gather_facts: false   # wersję wykrywamy przez raw - działa także na RHEL 6 bez Pythona 2.7+
+
+  vars: *cert_vars
+
+  tasks:
+    - name: Wykrycie głównej wersji RHEL
+      ansible.builtin.raw: sed -n 's/.*release \([0-9]\+\).*/\1/p' /etc/redhat-release
+      register: rhel_release
+      changed_when: false
+
+    - name: Zapamiętanie wersji systemu
+      ansible.builtin.set_fact:
+        rhel_major: "{{ rhel_release.stdout | trim | int }}"
+
+    - name: Sprawdzenie czy system jest obsługiwany (RHEL 6-10)
+      ansible.builtin.assert:
+        that: rhel_major | int in [6, 7, 8, 9, 10]
+        fail_msg: "Nieobsługiwany system (wykryto wersję: '{{ rhel_release.stdout | trim }}')"
+        success_msg: "Wykryto RHEL {{ rhel_major }}"
+
+    # ---------------- RHEL 7 / 8 / 9 / 10 - standardowe moduły ----------------
+    - name: RHEL 7-10
+      when: rhel_major | int >= 7
+      block:
+        - name: Upewnienie się, że katalog {{ cert_dest_dir }} istnieje
+          ansible.builtin.file:
+            path: "{{ cert_dest_dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Kopiowanie certyfikatów do {{ cert_dest_dir }}
+          ansible.builtin.copy:
+            src: "{{ item }}"
+            dest: "{{ cert_dest_dir }}/{{ item | basename }}"
+            owner: root
+            group: root
+            mode: "0644"
+          loop: "{{ cert_files }}"
+          register: cert_copy
+          notify: Aktualizacja magazynu zaufanych certyfikatów
+
+        # Pliki już były i są identyczne -> handler się nie uruchomi; tu można to wymusić
+        - name: Wymuszona aktualizacja magazynu (force_ca_update=true)
+          ansible.builtin.shell: |
+            if command -v update-ca-trust >/dev/null 2>&1; then
+              update-ca-trust extract
+            else
+              trust extract-compat
+            fi
+          when: force_ca_update | bool and cert_copy is not changed
+
+    # ---------------- RHEL 6 - wyłącznie moduł raw (Python 2.6) ----------------
+    - name: RHEL 6
+      when: rhel_major | int == 6
+      block:
+        - name: "RHEL 6: katalog + kopiowanie certyfikatów (raw)"
+          ansible.builtin.raw: |
+            set -e
+            DIR='{{ cert_dest_dir }}'
+            DEST="$DIR/{{ item | basename }}"
+            mkdir -p "$DIR"
+            chmod 0755 "$DIR"
+            TMP=$(mktemp)
+            echo '{{ lookup("ansible.builtin.file", item, rstrip=false) | b64encode }}' | base64 -d > "$TMP"
+            if [ -f "$DEST" ] && cmp -s "$TMP" "$DEST"; then
+              rm -f "$TMP"
+              echo "NOCHANGE"
+            else
+              mv -f "$TMP" "$DEST"
+              chown root:root "$DEST"
+              chmod 0644 "$DEST"
+              restorecon -F "$DEST" 2>/dev/null || true
+              echo "CHANGED"
+            fi
+          loop: "{{ cert_files }}"
+          register: rhel6_copy
+          changed_when: "'CHANGED' in rhel6_copy.stdout"
+
+        # Na RHEL 6 mechanizm ca-trust trzeba jednorazowo włączyć (update-ca-trust enable)
+        - name: "RHEL 6: update-ca-trust enable + extract (raw)"
+          ansible.builtin.raw: |
+            if ! command -v update-ca-trust >/dev/null 2>&1; then
+              echo "Brak update-ca-trust - zaktualizuj pakiet ca-certificates (yum update ca-certificates)" >&2
+              exit 1
+            fi
+            update-ca-trust enable && update-ca-trust extract
+          when: rhel6_copy is changed or force_ca_update | bool
+
+  handlers:
+    # RHEL 7-10: update-ca-trust (p11-kit); zamiennik, gdyby skryptu nie było: trust extract-compat
+    - name: Aktualizacja magazynu zaufanych certyfikatów
+      ansible.builtin.shell: |
+        if command -v update-ca-trust >/dev/null 2>&1; then
+          update-ca-trust extract
+        else
+          trust extract-compat
+        fi
+      changed_when: true
