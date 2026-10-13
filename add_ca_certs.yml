@@ -16,6 +16,12 @@
 #   ansible-playbook -i inventory add_ca_certs.yml --tags known_hosts
 #
 # Domyślnie playbook działa na grupie "rhel_servers" (zmiana: -e target=<grupa|host|wzorzec>).
+# Wybieraj hosty przez -e target, nie przez --limit (--limit pomija play'e na localhost,
+# czyli odświeżanie known_hosts i raport nieudanych hostów).
+#
+# Hosty, które się nie udały (brak połączenia SSH, błąd sudo, błąd update-ca-trust...),
+# są zapisywane obok inventory: hosts.ini -> hosts_nieudane.ini, inventory -> inventory_nieudane.
+# Plik jest gotowym inventory (grupa [nieudane]); gdy wszystko się uda, stary plik jest usuwany.
 #
 # Uwaga dot. RHEL 6: ma tylko Pythona 2.6, którego ansible-core >= 2.12 nie obsługuje,
 # dlatego dla RHEL 6 cała operacja jest wykonywana modułem "raw" (bez Pythona na hoście).
@@ -154,105 +160,190 @@
   vars: *cert_vars
 
   tasks:
-    - name: Wykrycie głównej wersji RHEL
-      ansible.builtin.raw: sed -n 's/.*release \([0-9]\+\).*/\1/p' /etc/redhat-release
-      register: rhel_release
-      changed_when: false
-      check_mode: false   # tylko odczyt - musi działać także w dry runie (-C)
+    # Cały przebieg w block/rescue: błąd na hoście jest zapisywany w ca_result zamiast
+    # przerywać playbook (przy błędzie na wszystkich hostach Ansible nie uruchomiłby PLAY 3).
+    - name: Wgranie certyfikatów
+      block:
+        - name: Wykrycie głównej wersji RHEL
+          ansible.builtin.raw: sed -n 's/.*release \([0-9]\+\).*/\1/p' /etc/redhat-release
+          register: rhel_release
+          changed_when: false
+          check_mode: false       # tylko odczyt - musi działać także w dry runie (-C)
+          ignore_unreachable: true
 
-    - name: Zapamiętanie wersji systemu
-      ansible.builtin.set_fact:
-        rhel_major: "{{ rhel_release.stdout | trim | int }}"
+        - name: Zapisanie hosta jako nieosiągalnego
+          ansible.builtin.set_fact:
+            ca_result: "BRAK POŁĄCZENIA: {{ rhel_release.msg | default('') | regex_replace('\\s+', ' ') | trim }}"
+          when: rhel_release.unreachable | default(false)
 
-    - name: Sprawdzenie czy system jest obsługiwany (RHEL 6-10)
+        - name: Pominięcie nieosiągalnego hosta
+          ansible.builtin.meta: end_host
+          when: rhel_release.unreachable | default(false)
+
+        - name: Zapamiętanie wersji systemu
+          ansible.builtin.set_fact:
+            rhel_major: "{{ rhel_release.stdout | trim | int }}"
+
+        - name: Sprawdzenie czy system jest obsługiwany (RHEL 6-10)
+          ansible.builtin.assert:
+            that: rhel_major | int in [6, 7, 8, 9, 10]
+            fail_msg: "Nieobsługiwany system (wykryto wersję: '{{ rhel_release.stdout | trim }}')"
+            success_msg: "Wykryto RHEL {{ rhel_major }}"
+
+        # ---------------- RHEL 7 / 8 / 9 / 10 - standardowe moduły ----------------
+        - name: RHEL 7-10
+          when: rhel_major | int >= 7
+          block:
+            - name: Upewnienie się, że katalog {{ cert_dest_dir }} istnieje
+              ansible.builtin.file:
+                path: "{{ cert_dest_dir }}"
+                state: directory
+                owner: root
+                group: root
+                mode: "0755"
+
+            - name: Kopiowanie certyfikatów do {{ cert_dest_dir }}
+              ansible.builtin.copy:
+                src: "{{ item }}"
+                dest: "{{ cert_dest_dir }}/{{ item | basename }}"
+                owner: root
+                group: root
+                mode: "0644"
+              loop: "{{ cert_files }}"
+              register: cert_copy
+
+            # update-ca-trust (p11-kit); zamiennik, gdyby skryptu nie było: trust extract-compat
+            - name: Aktualizacja magazynu zaufanych certyfikatów
+              ansible.builtin.shell: |
+                if command -v update-ca-trust >/dev/null 2>&1; then
+                  update-ca-trust extract
+                else
+                  trust extract-compat
+                fi
+              changed_when: true
+              when: cert_copy is changed or force_ca_update | bool
+
+        # ---------------- RHEL 6 - wyłącznie moduł raw (Python 2.6) ----------------
+        - name: RHEL 6
+          when: rhel_major | int == 6
+          block:
+            - name: "RHEL 6: katalog + kopiowanie certyfikatów (raw)"
+              ansible.builtin.raw: |
+                set -e
+                DIR='{{ cert_dest_dir }}'
+                DEST="$DIR/{{ item | basename }}"
+                mkdir -p "$DIR"
+                chmod 0755 "$DIR"
+                TMP=$(mktemp)
+                echo '{{ lookup("ansible.builtin.file", item, rstrip=false) | b64encode }}' | base64 -d > "$TMP"
+                if [ -f "$DEST" ] && cmp -s "$TMP" "$DEST"; then
+                  rm -f "$TMP"
+                  echo "NOCHANGE"
+                elif [ "{{ ansible_check_mode }}" = "True" ]; then
+                  rm -f "$TMP"
+                  echo "CHANGED (dry run - plik nie został skopiowany)"
+                else
+                  mv -f "$TMP" "$DEST"
+                  chown root:root "$DEST"
+                  chmod 0644 "$DEST"
+                  restorecon -F "$DEST" 2>/dev/null || true
+                  echo "CHANGED"
+                fi
+              loop: "{{ cert_files }}"
+              register: rhel6_copy
+              changed_when: "'CHANGED' in rhel6_copy.stdout"
+              check_mode: false   # w dry runie skrypt sam niczego nie zapisuje
+
+            # Na RHEL 6 mechanizm ca-trust trzeba jednorazowo włączyć (update-ca-trust enable)
+            - name: "RHEL 6: update-ca-trust enable + extract (raw)"
+              ansible.builtin.raw: |
+                if ! command -v update-ca-trust >/dev/null 2>&1; then
+                  echo "Brak update-ca-trust - zaktualizuj pakiet ca-certificates (yum update ca-certificates)" >&2
+                  exit 1
+                fi
+                update-ca-trust enable && update-ca-trust extract
+              when:
+                - rhel6_copy is changed or force_ca_update | bool
+                - not ansible_check_mode
+
+        - name: Zapisanie wyniku OK
+          ansible.builtin.set_fact:
+            ca_result: OK
+
+      rescue:
+        - name: Zapisanie przyczyny niepowodzenia
+          ansible.builtin.set_fact:
+            ca_result: >-
+              BŁĄD w zadaniu "{{ ansible_failed_task.name | default('?') }}":
+              {{ ((ansible_failed_result.msg | default('')) ~ ' ' ~ (ansible_failed_result.stderr | default('')))
+                 | regex_replace('\s+', ' ') | trim }}
+
+        - name: Informacja o niepowodzeniu
+          ansible.builtin.debug:
+            msg: "{{ ca_result }}"
+
+# =====================================================================
+# PLAY 3: kontroler - zapis hostów, które się nie udały, do <inventory>_nieudane
+# =====================================================================
+- name: Raport hostów nieudanych
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    <<: *cert_vars
+    # Hosty z tego uruchomienia (z uwzględnieniem --limit, jeśli był podany)
+    run_hosts: >-
+      {{ query('ansible.builtin.inventory_hostnames', target_group)
+         | intersect(query('ansible.builtin.inventory_hostnames', ansible_limit | default('all')))
+         | difference(['localhost']) }}
+    failed_hosts: >-
+      {{ run_hosts | reject('in', run_hosts | map('extract', hostvars) | selectattr('ca_result', 'defined')
+         | selectattr('ca_result', 'equalto', 'OK') | map(attribute='inventory_hostname') | list) | list }}
+    # Plik obok pierwszego inventory: hosts.ini -> hosts_nieudane.ini, inventory -> inventory_nieudane
+    inv_src: "{{ ansible_inventory_sources | first }}"
+    failed_file: >-
+      {%- if inv_src is file -%}
+        {{ inv_src | dirname }}/{{ (inv_src | basename | splitext)[0] }}_nieudane{{ (inv_src | splitext)[1] }}
+      {%- elif inv_src is directory -%}
+        {{ inv_src | regex_replace('/+$', '') }}_nieudane
+      {%- else -%}
+        {{ playbook_dir }}/inventory_nieudane
+      {%- endif -%}
+    # Zmienne połączenia przepisywane do pliku, żeby dało się go użyć jako inventory
+    conn_vars: [ansible_host, ansible_port, ansible_user, ansible_connection, ansible_ssh_common_args, ansible_python_interpreter]
+
+  tasks:
+    - name: Zapis nieudanych hostów do {{ failed_file }}
+      ansible.builtin.copy:
+        dest: "{{ failed_file }}"
+        mode: "0644"
+        content: |
+          # Hosty, na których nie udało się wgrać certyfikatów CA ({{ now(fmt='%Y-%m-%d %H:%M:%S') }}{{ ', dry run' if ansible_check_mode else '' }})
+          # Ponowne uruchomienie tylko dla nich:
+          #   ansible-playbook -i {{ failed_file }} {{ playbook_dir }}/add_ca_certs.yml -K -e target=nieudane
+          [nieudane]
+          {% for h in failed_hosts %}
+          # {{ hostvars[h].ca_result | default('BRAK WYNIKU - host nie został przetworzony') }}
+          {{ h }}{% for v in conn_vars if hostvars[h][v] is defined %} {{ v }}='{{ hostvars[h][v] }}'{% endfor %}
+
+          {% endfor %}
+      when: failed_hosts | length > 0
+      check_mode: false   # raport zapisywany także w dry runie
+
+    - name: Usunięcie starego pliku, gdy wszystko się udało
+      ansible.builtin.file:
+        path: "{{ failed_file }}"
+        state: absent
+      when: failed_hosts | length == 0
+      check_mode: false
+
+    # Kończy playbook kodem != 0, jeśli coś się nie udało (błędy hostów są przechwytywane w rescue)
+    - name: Podsumowanie
       ansible.builtin.assert:
-        that: rhel_major | int in [6, 7, 8, 9, 10]
-        fail_msg: "Nieobsługiwany system (wykryto wersję: '{{ rhel_release.stdout | trim }}')"
-        success_msg: "Wykryto RHEL {{ rhel_major }}"
-
-    # ---------------- RHEL 7 / 8 / 9 / 10 - standardowe moduły ----------------
-    - name: RHEL 7-10
-      when: rhel_major | int >= 7
-      block:
-        - name: Upewnienie się, że katalog {{ cert_dest_dir }} istnieje
-          ansible.builtin.file:
-            path: "{{ cert_dest_dir }}"
-            state: directory
-            owner: root
-            group: root
-            mode: "0755"
-
-        - name: Kopiowanie certyfikatów do {{ cert_dest_dir }}
-          ansible.builtin.copy:
-            src: "{{ item }}"
-            dest: "{{ cert_dest_dir }}/{{ item | basename }}"
-            owner: root
-            group: root
-            mode: "0644"
-          loop: "{{ cert_files }}"
-          register: cert_copy
-          notify: Aktualizacja magazynu zaufanych certyfikatów
-
-        # Pliki już były i są identyczne -> handler się nie uruchomi; tu można to wymusić
-        - name: Wymuszona aktualizacja magazynu (force_ca_update=true)
-          ansible.builtin.shell: |
-            if command -v update-ca-trust >/dev/null 2>&1; then
-              update-ca-trust extract
-            else
-              trust extract-compat
-            fi
-          when: force_ca_update | bool and cert_copy is not changed
-
-    # ---------------- RHEL 6 - wyłącznie moduł raw (Python 2.6) ----------------
-    - name: RHEL 6
-      when: rhel_major | int == 6
-      block:
-        - name: "RHEL 6: katalog + kopiowanie certyfikatów (raw)"
-          ansible.builtin.raw: |
-            set -e
-            DIR='{{ cert_dest_dir }}'
-            DEST="$DIR/{{ item | basename }}"
-            mkdir -p "$DIR"
-            chmod 0755 "$DIR"
-            TMP=$(mktemp)
-            echo '{{ lookup("ansible.builtin.file", item, rstrip=false) | b64encode }}' | base64 -d > "$TMP"
-            if [ -f "$DEST" ] && cmp -s "$TMP" "$DEST"; then
-              rm -f "$TMP"
-              echo "NOCHANGE"
-            elif [ "{{ ansible_check_mode }}" = "True" ]; then
-              rm -f "$TMP"
-              echo "CHANGED (dry run - plik nie został skopiowany)"
-            else
-              mv -f "$TMP" "$DEST"
-              chown root:root "$DEST"
-              chmod 0644 "$DEST"
-              restorecon -F "$DEST" 2>/dev/null || true
-              echo "CHANGED"
-            fi
-          loop: "{{ cert_files }}"
-          register: rhel6_copy
-          changed_when: "'CHANGED' in rhel6_copy.stdout"
-          check_mode: false   # w dry runie skrypt sam niczego nie zapisuje
-
-        # Na RHEL 6 mechanizm ca-trust trzeba jednorazowo włączyć (update-ca-trust enable)
-        - name: "RHEL 6: update-ca-trust enable + extract (raw)"
-          ansible.builtin.raw: |
-            if ! command -v update-ca-trust >/dev/null 2>&1; then
-              echo "Brak update-ca-trust - zaktualizuj pakiet ca-certificates (yum update ca-certificates)" >&2
-              exit 1
-            fi
-            update-ca-trust enable && update-ca-trust extract
-          when:
-            - rhel6_copy is changed or force_ca_update | bool
-            - not ansible_check_mode
-
-  handlers:
-    # RHEL 7-10: update-ca-trust (p11-kit); zamiennik, gdyby skryptu nie było: trust extract-compat
-    - name: Aktualizacja magazynu zaufanych certyfikatów
-      ansible.builtin.shell: |
-        if command -v update-ca-trust >/dev/null 2>&1; then
-          update-ca-trust extract
-        else
-          trust extract-compat
-        fi
-      changed_when: true
+        that: failed_hosts | length == 0
+        success_msg: "Wszystkie hosty OK ({{ run_hosts | length }})"
+        fail_msg: >-
+          Nieudane: {{ failed_hosts | length }}/{{ run_hosts | length }} ({{ failed_hosts | join(', ') }})
+          - zapisano do {{ failed_file }}
