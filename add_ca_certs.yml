@@ -164,8 +164,10 @@
     # przerywać playbook (przy błędzie na wszystkich hostach Ansible nie uruchomiłby PLAY 3).
     - name: Wgranie certyfikatów
       block:
+        # raw działa przez pseudo-terminal, więc do stdout trafiają też śmieci z plików startowych
+        # powłoki (np. błąd w /etc/bashrc) - wersja jest oznaczona i wyciągana regexem.
         - name: Wykrycie głównej wersji RHEL
-          ansible.builtin.raw: sed -n 's/.*release \([0-9]\+\).*/\1/p' /etc/redhat-release
+          ansible.builtin.raw: echo "RHEL_MAJOR=$(sed -n 's/.*release \([0-9]\+\).*/\1/p' /etc/redhat-release)"
           register: rhel_release
           changed_when: false
           check_mode: false       # tylko odczyt - musi działać także w dry runie (-C)
@@ -182,12 +184,12 @@
 
         - name: Zapamiętanie wersji systemu
           ansible.builtin.set_fact:
-            rhel_major: "{{ rhel_release.stdout | trim | int }}"
+            rhel_major: "{{ rhel_release.stdout | regex_search('RHEL_MAJOR=([0-9]+)', '\\1') | default(['0'], true) | first | int }}"
 
         - name: Sprawdzenie czy system jest obsługiwany (RHEL 6-10)
           ansible.builtin.assert:
             that: rhel_major | int in [6, 7, 8, 9, 10]
-            fail_msg: "Nieobsługiwany system (wykryto wersję: '{{ rhel_release.stdout | trim }}')"
+            fail_msg: "Nieobsługiwany system - nie rozpoznano wersji RHEL. Wynik: '{{ rhel_release.stdout | trim }}'"
             success_msg: "Wykryto RHEL {{ rhel_major }}"
 
         # ---------------- RHEL 7 / 8 / 9 / 10 - standardowe moduły ----------------
