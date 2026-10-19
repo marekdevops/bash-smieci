@@ -23,6 +23,11 @@
 # są zapisywane obok inventory: hosts.ini -> hosts_nieudane.ini, inventory -> inventory_nieudane.
 # Plik jest gotowym inventory (grupa [nieudane]); gdy wszystko się uda, stary plik jest usuwany.
 #
+# Stare hosty (RHEL 5/6) ze starymi algorytmami SSH ("no matching key exchange method found",
+# "no matching host key type found"): dopisz je do legacy_ssh_hosts poniżej albo ustaw
+# w inventory ssh_legacy=true. Połączenie do nich dostanie opcje z legacy_ssh_options
+# (jak ssh -oKexAlgorithms=+... z linii poleceń).
+#
 # Uwaga dot. RHEL 6: ma tylko Pythona 2.6, którego ansible-core >= 2.12 nie obsługuje,
 # dlatego dla RHEL 6 cała operacja jest wykonywana modułem "raw" (bez Pythona na hoście).
 
@@ -46,6 +51,31 @@
     # true = uruchom update-ca-trust nawet gdy certyfikaty na serwerze są już identyczne
     force_ca_update: false
     known_hosts_file: "{{ lookup('env', 'HOME') }}/.ssh/known_hosts"
+
+    # --- Hosty ze starym SSH (nazwy z inventory, grupy lub wzorce, np. "rhel5_servers") ---
+    # Alternatywnie w inventory: srv-old ansible_host=10.0.0.5 ssh_legacy=true
+    legacy_ssh_hosts: []
+    #   - srv-old1
+    #   - rhel5_servers
+
+    # Opcje ssh dla tych hostów ("+" = dodaj do domyślnych, nie zastępuj).
+    # Wartości bierz z komunikatu błędu: "... Their offer: <lista>".
+    legacy_ssh_options:
+      KexAlgorithms: +diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1,diffie-hellman-group1-sha1
+      HostKeyAlgorithms: +ssh-rsa,ssh-dss           # OpenSSH >= 10 na kontrolerze nie zna ssh-dss - usuń je
+      PubkeyAcceptedAlgorithms: +ssh-rsa,ssh-dss    # OpenSSH < 8.5 na kontrolerze: PubkeyAcceptedKeyTypes
+      Ciphers: +aes128-cbc,aes256-cbc,3des-cbc
+      # MACs: +hmac-sha1
+
+    # Wyliczane - nie zmieniać
+    legacy_ssh_args: "{% for k, v in legacy_ssh_options.items() %}-o {{ k }}={{ v }} {% endfor %}"
+    legacy_host_list: >-
+      {%- set l = query('ansible.builtin.inventory_hostnames', legacy_ssh_hosts | join(','))
+                  if legacy_ssh_hosts | length > 0 else [] -%}
+      {%- for h in groups['all'] if hostvars[h].ssh_legacy | default(false) | bool -%}
+        {%- set _ = l.append(h) -%}
+      {%- endfor -%}
+      {{ l | unique }}
 
   tasks:
     - name: Sprawdzenie czy pliki certyfikatów istnieją lokalnie
@@ -93,14 +123,36 @@
         HOST='{{ ssh_host }}'
         PORT='{{ ssh_port }}'
         DRY='{{ ansible_check_mode }}'
+        LEGACY='{{ item in legacy_host_list }}'
+        SSH_ARGS='{{ ssh_args }}'
         CHANGED_NAMES=""
 
         entry_name() { if [ "$PORT" = "22" ]; then echo "$1"; else echo "[$1]:$PORT"; fi; }
 
-        NEW_KEYS=$(ssh-keyscan -T 5 -p "$PORT" "$HOST" 2>/dev/null | grep -v '^#' | awk '{print $2" "$3}' | sort -u || true)
-        if [ -z "$NEW_KEYS" ]; then
-          echo "NOSCAN"
-          exit 0
+        if [ "$LEGACY" = "True" ]; then
+          # ssh-keyscan nie przyjmuje opcji -o (KexAlgorithms itp.), więc dla starych hostów
+          # klucz jest zbierany zwykłym ssh z opcjami legacy do pustego, tymczasowego known_hosts
+          # (autoryzacja celowo wyłączona - potrzebny jest tylko klucz hosta).
+          TMPKH=$(mktemp)
+          ERR=$(ssh $SSH_ARGS -p "$PORT" \
+                  -o BatchMode=yes -o ConnectTimeout=5 \
+                  -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$TMPKH" \
+                  -o GlobalKnownHostsFile=/dev/null -o HashKnownHosts=no -o CheckHostIP=no \
+                  -o PubkeyAuthentication=no -o PasswordAuthentication=no \
+                  -o KbdInteractiveAuthentication=no -o GSSAPIAuthentication=no \
+                  "$HOST" true 2>&1 >/dev/null || true)
+          NEW_KEYS=$(awk '{print $2" "$3}' "$TMPKH" | sort -u)
+          rm -f "$TMPKH"
+          if [ -z "$NEW_KEYS" ]; then
+            echo "NOSCAN: $(echo "$ERR" | grep -v '^Warning' | tail -1)"
+            exit 0
+          fi
+        else
+          NEW_KEYS=$(ssh-keyscan -T 5 -p "$PORT" "$HOST" 2>/dev/null | grep -v '^#' | awk '{print $2" "$3}' | sort -u || true)
+          if [ -z "$NEW_KEYS" ]; then
+            echo "NOSCAN: brak odpowiedzi ssh-keyscan (host nieosiągalny albo stare algorytmy SSH - patrz legacy_ssh_hosts)"
+            exit 0
+          fi
         fi
 
         # $1 - nazwa/IP, $2 - czy dodać wpis, gdy go brak (yes/no)
@@ -108,6 +160,10 @@
           local name old
           name=$(entry_name "$1")
           old=$(ssh-keygen -F "$name" -f "$KH" 2>/dev/null | grep -v '^#' | awk '{print $2" "$3}' | sort -u || true)
+          if [ "$LEGACY" = "True" ]; then
+            # przez ssh poznajemy tylko klucz wynegocjowanego typu - porównujemy tylko ten typ
+            old=$(echo "$old" | grep -E "^($(echo "$NEW_KEYS" | awk '{print $1}' | paste -sd'|')) " || true)
+          fi
           [ "$old" = "$NEW_KEYS" ] && return 0
           [ -z "$old" ] && [ "$2" = "no" ] && return 0
           CHANGED_NAMES="$CHANGED_NAMES $name"
@@ -134,6 +190,10 @@
       vars:
         ssh_host: "{{ hostvars[item].ansible_host | default(item) }}"
         ssh_port: "{{ hostvars[item].ansible_port | default(22) }}"
+        ssh_args: >-
+          {{ hostvars[item].ansible_ssh_common_args | default('') }}
+          {{ hostvars[item].ansible_ssh_extra_args | default('') }}
+          {{ legacy_ssh_args if item in legacy_host_list else '' }}
       loop: "{{ query('ansible.builtin.inventory_hostnames', target_group) | difference(['localhost']) }}"
       register: keyscan
       changed_when: "'CHANGED' in keyscan.stdout"
@@ -143,7 +203,7 @@
     - name: Ostrzeżenie o hostach, z których nie udało się pobrać klucza SSH
       tags: [known_hosts]
       ansible.builtin.debug:
-        msg: "Nie udało się pobrać klucza SSH z {{ item.item }} - host może być nieosiągalny."
+        msg: "Nie udało się pobrać klucza SSH z {{ item.item }} - {{ item.stdout | trim | regex_replace('^NOSCAN:\\s*', '') }}"
       loop: "{{ keyscan.results }}"
       loop_control:
         label: "{{ item.item }}"
@@ -162,6 +222,14 @@
   tasks:
     # Cały przebieg w block/rescue: błąd na hoście jest zapisywany w ca_result zamiast
     # przerywać playbook (przy błędzie na wszystkich hostach Ansible nie uruchomiłby PLAY 3).
+    # set_fact działa na kontrolerze (bez łączenia z hostem), więc opcje są ustawione,
+    # zanim Ansible pierwszy raz połączy się z hostem.
+    - name: Opcje SSH dla starych hostów (legacy_ssh_hosts / ssh_legacy=true)
+      ansible.builtin.set_fact:
+        ansible_ssh_extra_args: "{{ (ansible_ssh_extra_args | default('') ~ ' ' ~ legacy_ssh_args) | trim }}"
+        ssh_legacy: true
+      when: inventory_hostname in legacy_host_list
+
     - name: Wgranie certyfikatów
       block:
         # raw działa przez pseudo-terminal, więc do stdout trafiają też śmieci z plików startowych
@@ -314,7 +382,7 @@
         {{ playbook_dir }}/inventory_nieudane
       {%- endif -%}
     # Zmienne połączenia przepisywane do pliku, żeby dało się go użyć jako inventory
-    conn_vars: [ansible_host, ansible_port, ansible_user, ansible_connection, ansible_ssh_common_args, ansible_python_interpreter]
+    conn_vars: [ansible_host, ansible_port, ansible_user, ansible_connection, ansible_ssh_common_args, ansible_python_interpreter, ssh_legacy]
 
   tasks:
     - name: Zapis nieudanych hostów do {{ failed_file }}
