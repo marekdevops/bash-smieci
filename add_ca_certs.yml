@@ -27,6 +27,11 @@
 # "no matching host key type found"): dopisz je do legacy_ssh_hosts poniżej albo ustaw
 # w inventory ssh_legacy=true. Połączenie do nich dostanie opcje z legacy_ssh_options
 # (jak ssh -oKexAlgorithms=+... z linii poleceń).
+# Algorytmy można też dopisać jednorazowo z linii poleceń - wtedy opcje legacy dostają
+# WSZYSTKIE hosty z danego uruchomienia ("+" tylko dodaje, nowe serwery działają jak dotąd):
+#   ansible-playbook -i inventory_nieudane add_ca_certs.yml -K -e target=nieudane \
+#     -e ssh_kex=+diffie-hellman-group1-sha1 -e ssh_hostkey=+ssh-rsa
+# Zmienne: ssh_kex, ssh_hostkey, ssh_pubkey, ssh_ciphers, ssh_macs (kilka wartości po przecinku).
 #
 # Uwaga dot. RHEL 6: ma tylko Pythona 2.6, którego ansible-core >= 2.12 nie obsługuje,
 # dlatego dla RHEL 6 cała operacja jest wykonywana modułem "raw" (bez Pythona na hoście).
@@ -67,10 +72,36 @@
       Ciphers: +aes128-cbc,aes256-cbc,3des-cbc
       # MACs: +hmac-sha1
 
+    # Dopisywanie algorytmów z linii poleceń: -e ssh_kex=+diffie-hellman-group1-sha1 itd.
+    ssh_kex: ""
+    ssh_hostkey: ""
+    ssh_pubkey: ""
+    ssh_ciphers: ""
+    ssh_macs: ""
+
     # Wyliczane - nie zmieniać
-    legacy_ssh_args: "{% for k, v in legacy_ssh_options.items() %}-o {{ k }}={{ v }} {% endfor %}"
+    legacy_ssh_cli:
+      KexAlgorithms: "{{ ssh_kex }}"
+      HostKeyAlgorithms: "{{ ssh_hostkey }}"
+      PubkeyAcceptedAlgorithms: "{{ ssh_pubkey }}"
+      Ciphers: "{{ ssh_ciphers }}"
+      MACs: "{{ ssh_macs }}"
+    legacy_ssh_cli_given: "{{ legacy_ssh_cli.values() | select | list | length > 0 }}"
+    # legacy_ssh_options + algorytmy z -e ssh_* (połączone, bez duplikatów, zawsze z "+")
+    legacy_ssh_effective: >-
+      {%- set r = {} -%}
+      {%- for k in (legacy_ssh_options.keys() | list + legacy_ssh_cli.keys() | list) | unique -%}
+        {%- set base = (legacy_ssh_options[k] | default('') | string | trim).lstrip('+') -%}
+        {%- set add = (legacy_ssh_cli[k] | default('') | string | trim).lstrip('+') -%}
+        {%- set vals = ((base.split(',') if base else []) + (add.split(',') if add else []))
+                       | map('trim') | select | unique | list -%}
+        {%- if vals -%}{%- set _ = r.update({k: '+' ~ vals | join(',')}) -%}{%- endif -%}
+      {%- endfor -%}
+      {{ r }}
+    legacy_ssh_args: "{% for k, v in legacy_ssh_effective.items() %}-o {{ k }}={{ v }} {% endfor %}"
     legacy_host_list: >-
-      {%- set l = query('ansible.builtin.inventory_hostnames', legacy_ssh_hosts | join(','))
+      {%- set l = query('ansible.builtin.inventory_hostnames', target_group) if legacy_ssh_cli_given | bool
+                  else query('ansible.builtin.inventory_hostnames', legacy_ssh_hosts | join(','))
                   if legacy_ssh_hosts | length > 0 else [] -%}
       {%- for h in groups['all'] if hostvars[h].ssh_legacy | default(false) | bool -%}
         {%- set _ = l.append(h) -%}
@@ -372,12 +403,13 @@
       {{ run_hosts | reject('in', run_hosts | map('extract', hostvars) | selectattr('ca_result', 'defined')
          | selectattr('ca_result', 'equalto', 'OK') | map(attribute='inventory_hostname') | list) | list }}
     # Plik obok pierwszego inventory: hosts.ini -> hosts_nieudane.ini, inventory -> inventory_nieudane
+    # (uruchomienie na pliku *_nieudane nadpisuje ten sam plik - zostają tylko wciąż nieudane hosty)
     inv_src: "{{ ansible_inventory_sources | first }}"
     failed_file: >-
       {%- if inv_src is file -%}
-        {{ inv_src | dirname }}/{{ (inv_src | basename | splitext)[0] }}_nieudane{{ (inv_src | splitext)[1] }}
+        {{ inv_src | dirname }}/{{ (inv_src | basename | splitext)[0] | regex_replace('_nieudane$', '') }}_nieudane{{ (inv_src | splitext)[1] }}
       {%- elif inv_src is directory -%}
-        {{ inv_src | regex_replace('/+$', '') }}_nieudane
+        {{ inv_src | regex_replace('/+$', '') | regex_replace('_nieudane$', '') }}_nieudane
       {%- else -%}
         {{ playbook_dir }}/inventory_nieudane
       {%- endif -%}
