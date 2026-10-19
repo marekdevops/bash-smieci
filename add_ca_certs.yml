@@ -67,8 +67,8 @@
     # Wartości bierz z komunikatu błędu: "... Their offer: <lista>".
     legacy_ssh_options:
       KexAlgorithms: +diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1,diffie-hellman-group1-sha1
-      HostKeyAlgorithms: +ssh-rsa,ssh-dss           # OpenSSH >= 10 na kontrolerze nie zna ssh-dss - usuń je
-      PubkeyAcceptedAlgorithms: +ssh-rsa,ssh-dss    # OpenSSH < 8.5 na kontrolerze: PubkeyAcceptedKeyTypes
+      HostKeyAlgorithms: +ssh-rsa,ssh-dss           # algorytmy nieznane lokalnemu ssh są pomijane automatycznie
+      PubkeyAcceptedAlgorithms: +ssh-rsa,ssh-dss    # na OpenSSH < 8.5 zamieniane automatycznie na PubkeyAcceptedKeyTypes
       Ciphers: +aes128-cbc,aes256-cbc,3des-cbc
       # MACs: +hmac-sha1
 
@@ -98,7 +98,9 @@
         {%- if vals -%}{%- set _ = r.update({k: '+' ~ vals | join(',')}) -%}{%- endif -%}
       {%- endfor -%}
       {{ r }}
-    legacy_ssh_args: "{% for k, v in legacy_ssh_effective.items() %}-o {{ k }}={{ v }} {% endfor %}"
+    legacy_ssh_args_raw: "{% for k, v in legacy_ssh_effective.items() %}-o {{ k }}={{ v }} {% endfor %}"
+    # Opcje po sprawdzeniu, co obsługuje lokalny klient ssh (zadanie na początku PLAY 1)
+    legacy_ssh_args: "{{ hostvars['localhost'].legacy_ssh_args_checked | default(legacy_ssh_args_raw) }}"
     legacy_host_list: >-
       {%- set l = query('ansible.builtin.inventory_hostnames', target_group) if legacy_ssh_cli_given | bool
                   else query('ansible.builtin.inventory_hostnames', legacy_ssh_hosts | join(','))
@@ -109,6 +111,58 @@
       {{ l | unique }}
 
   tasks:
+    # Starszy OpenSSH (< 8.5, np. RHEL 7/8) nie zna nazwy PubkeyAcceptedAlgorithms, a nowszy
+    # (>= 10) nie zna np. ssh-dss - jedna nieznana opcja/algorytm psuje całe połączenie
+    # ("Bad configuration option"). ssh -G tylko parsuje opcje, z nikim się nie łączy.
+    - name: Dopasowanie opcji legacy SSH do lokalnego klienta ssh
+      tags: [always]
+      ansible.builtin.shell: |
+        ok() { ssh -G -o "$1" ssh-option-check >/dev/null 2>&1; }
+        ARGS=""
+        while IFS='=' read -r key val; do
+          [ -n "$key" ] || continue
+          # nazwa opcji sprawdzana z bezpieczną wartością, niezależnie od listy algorytmów
+          if [ "$key" = "PubkeyAcceptedAlgorithms" ] && ! ok "$key=+ssh-ed25519" \
+             && ok "PubkeyAcceptedKeyTypes=+ssh-ed25519"; then
+            echo "NOTE: $key -> PubkeyAcceptedKeyTypes (lokalny OpenSSH < 8.5)"
+            key=PubkeyAcceptedKeyTypes
+          fi
+          if ! ok "$key=$val"; then
+            # sprawdzenie algorytmów pojedynczo - zostają tylko te, które zna lokalny ssh
+            keep=""
+            for alg in $(echo "${val#+}" | tr ',' ' '); do
+              if ok "$key=+$alg"; then keep="$keep,$alg"; else echo "NOTE: $key: lokalny ssh nie obsługuje '$alg' - pominięto"; fi
+            done
+            if [ -z "$keep" ]; then
+              echo "NOTE: $key: opcja pominięta (lokalny ssh jej nie obsługuje)"
+              continue
+            fi
+            val="+${keep#,}"
+          fi
+          ARGS="$ARGS -o $key=$val"
+        done <<'EOF'
+        {% for k, v in legacy_ssh_effective.items() %}
+        {{ k }}={{ v }}
+        {% endfor %}
+        EOF
+        echo "ARGS:${ARGS# }"
+      args:
+        executable: /bin/bash
+      register: ssh_opt_check
+      changed_when: false
+      check_mode: false
+
+    - name: Zapamiętanie sprawdzonych opcji legacy SSH
+      tags: [always]
+      ansible.builtin.set_fact:
+        legacy_ssh_args_checked: "{{ ssh_opt_check.stdout_lines | select('match', '^ARGS:') | first | regex_replace('^ARGS:', '') }}"
+
+    - name: Ostrzeżenie o zmienionych opcjach legacy SSH
+      tags: [always]
+      ansible.builtin.debug:
+        msg: "{{ ssh_opt_check.stdout_lines | select('match', '^NOTE:') | map('regex_replace', '^NOTE: ', '') | list }}"
+      when: ssh_opt_check.stdout_lines | select('match', '^NOTE:') | list | length > 0
+
     - name: Sprawdzenie czy pliki certyfikatów istnieją lokalnie
       ansible.builtin.stat:
         path: "{{ item }}"
