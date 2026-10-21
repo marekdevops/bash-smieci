@@ -1,0 +1,777 @@
+#!/usr/bin/env bash
+# Diagnostyka połączenia TLS z podanym adresem z punktu widzenia tego hosta (RHEL 7/8/9).
+# Łączy się klientem openssl, weryfikuje certyfikat serwera względem bundla systemowego
+# i ustala, czego brakuje do poprawnego połączenia - po stronie klienta i po stronie serwera.
+#
+# Sprawdza po kolei: DNS -> TCP (każdy adres IP) -> handshake TLS (wersje protokołu, polityka
+# crypto-policies, mTLS) -> łańcuch wysłany przez serwer (kolejność, brakujące pośrednie,
+# daty, nazwa hosta, SAN, EKU, słabe klucze/SHA1) -> zaufanie (czy wystawca jest w bundlu;
+# brakujące CA pobiera z AIA i sprawdza, czy ich dodanie naprawi weryfikację) ->
+# spójność (czy wszystkie IP i połączenie bez SNI dają ten sam certyfikat).
+# Na końcu: diagnoza i konkretne polecenia do wykonania.
+#
+# Skrypt niczego nie zmienia w systemie. Certyfikaty potrzebne do naprawy zapisuje w -o.
+#
+# Użycie:
+#   ./cert_connect_verify.yml adres:8100
+#   ./cert_connect_verify.yml https://adres:8443/sciezka     # URL też zadziała
+#   ./cert_connect_verify.yml -n inna.nazwa 10.1.2.3:443     # SNI / nazwa do weryfikacji
+#   ./cert_connect_verify.yml -x proxy.firma:3128 adres:443  # przez proxy HTTP (CONNECT)
+#   ./cert_connect_verify.yml -s smtp poczta:587             # STARTTLS (smtp, imap, pop3, ftp, ldap, postgres...)
+#   ./cert_connect_verify.yml -c /sciezka/ca.pem adres:443   # inny bundle CA niż systemowy
+#   ./cert_connect_verify.yml -H adres:443                   # dodatkowo test HTTP przez curl
+#
+# Opcje:
+#   -n NAZWA    SNI i nazwa do weryfikacji (domyślnie: host z adresu)
+#   -c PLIK     bundle CA (domyślnie /etc/pki/tls/certs/ca-bundle.crt)
+#   -x PROXY    proxy HTTP host:port
+#   -s PROTO    STARTTLS
+#   -t SEKUNDY  timeout pojedynczej próby (domyślnie 10)
+#   -d DNI      ostrzegaj o certyfikatach wygasających w ciągu DNI (domyślnie 30)
+#   -o KATALOG  gdzie zapisać certyfikaty (domyślnie ./cert_connect_<host>_<port>_<czas>)
+#   -N          nie pobieraj brakujących CA z AIA (środowisko bez dostępu do sieci)
+#   -H          test HTTP przez curl z tym samym bundlem
+#
+# Kod wyjścia: 0 - połączenie poprawne, 1 - połączenie działa, ale są problemy z certyfikatem,
+#              2 - nie da się nawiązać połączenia TLS.
+
+set -uo pipefail   # bez -e: openssl/grep zwracają != 0 w zwykłych sytuacjach
+
+SNI=""
+CAFILE=/etc/pki/tls/certs/ca-bundle.crt
+PROXY=""
+STARTTLS=""
+TO=10
+DAYS_WARNING=30
+OUT_DIR=""
+FETCH_AIA=true
+HTTP_TEST=false
+
+ANCHORS=/etc/pki/ca-trust/source/anchors
+
+if [ -t 1 ]; then
+  RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; BLU=$'\e[34m'; BLD=$'\e[1m'; RST=$'\e[0m'
+else
+  RED=; GRN=; YEL=; BLU=; BLD=; RST=
+fi
+
+usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+ok()    { echo "  ${GRN}[OK]${RST} $*"; }
+bad()   { echo "  ${RED}[!!]${RST} $*"; }
+wrn()   { echo "  ${YEL}[??]${RST} $*"; }
+note()  { echo "  ${BLU}[--]${RST} $*"; }
+hdr()   { echo; echo "${BLD}=== $* ===${RST}"; }
+die()   { echo "BŁĄD: $*" >&2; exit 2; }
+
+ORIG_ARGS=("$@")
+while getopts ":n:c:x:s:t:d:o:NHh" opt; do
+  case "$opt" in
+    n) SNI=$OPTARG ;;
+    c) CAFILE=$OPTARG ;;
+    x) PROXY=$OPTARG ;;
+    s) STARTTLS=$OPTARG ;;
+    t) [[ "$OPTARG" =~ ^[0-9]+$ ]] || die "-t: podaj liczbę sekund"; TO=$OPTARG ;;
+    d) [[ "$OPTARG" =~ ^[0-9]+$ ]] || die "-d: podaj liczbę dni"; DAYS_WARNING=$OPTARG ;;
+    o) OUT_DIR=$OPTARG ;;
+    N) FETCH_AIA=false ;;
+    H) HTTP_TEST=true ;;
+    h) usage 0 ;;
+    :) die "Opcja -$OPTARG wymaga argumentu" ;;
+    *) usage 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 1 ] || usage 1
+
+command -v openssl >/dev/null || die "Brak polecenia openssl"
+[ -r "$CAFILE" ] || die "Nie mogę odczytać bundla CA: $CAFILE"
+
+# --- adres: host[:port], [ipv6]:port, URL ---
+T=$1; T=${T#*://}; T=${T%%/*}; PORT=""
+if [[ $T == \[*\]* ]]; then
+  HOST=${T#[}; HOST=${HOST%%]*}; rest=${T#*]}; PORT=${rest#:}
+elif [[ $T == *:*:* ]]; then
+  HOST=$T                                  # goły IPv6 bez portu
+else
+  HOST=${T%%:*}; [[ $T == *:* ]] && PORT=${T##*:}
+fi
+if [ -z "$PORT" ]; then
+  case $1 in http://*) PORT=80 ;; *) PORT=443 ;; esac
+fi
+[[ "$PORT" =~ ^[0-9]+$ ]] || die "Nieprawidłowy port: $PORT"
+
+is_ip() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || $1 == *:* ]]; }
+hostport() { if [[ $1 == *:* ]]; then echo "[$1]:$2"; else echo "$1:$2"; fi; }
+
+if [ -z "$SNI" ] && ! is_ip "$HOST"; then SNI=$HOST; fi
+VERIFY_NAME=${SNI:-$HOST}
+
+TS=$(date +%Y%m%d_%H%M%S)
+NOW=$(date +%s)
+OUT_DIR=${OUT_DIR:-$PWD/cert_connect_$(tr -c 'A-Za-z0-9.-' '_' <<< "$HOST" | sed 's/_*$//')_${PORT}_$TS}
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+OSSL_VER=$(openssl version)
+RHEL_MAJOR=$(sed -n 's/.*release \([0-9]\+\).*/\1/p' /etc/redhat-release 2>/dev/null)
+OSSL_HELP=$(openssl s_client -help 2>&1)
+has_opt() { grep -qE -- "^ *-$1( |$)" <<< "$OSSL_HELP"; }
+
+CLIENT_FIX=()   # co zrobić na tym hoście
+SERVER_FIX=()   # co musi poprawić właściciel serwera
+NOTES=()
+CERT_PROBLEMS=0
+
+# s_client z ustawieniami wspólnymi dla wszystkich prób: cel [dodatkowe opcje...]
+sclient() {
+  local target=$1; shift
+  local args=(-connect "$(hostport "$target" "$PORT")")
+  [ -n "$STARTTLS" ] && args+=(-starttls "$STARTTLS")
+  [ -n "$PROXY" ] && args+=(-proxy "$PROXY")
+  timeout "$TO" openssl s_client "${args[@]}" "$@" </dev/null 2>&1
+}
+handshake_ok() { grep -qE '^New, .*Cipher is [^(]' <<< "$1"; }
+
+# Rozbija wyjście s_client -showcerts / plik PEM na certyfikaty: wejście katalog prefiks
+split_pem() {
+  awk -v d="$1" -v p="$2" '
+    /-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/%s%02d.pem", d, p, n); inside = 1 }
+    inside { print > f }
+    /-----END CERTIFICATE-----/   { inside = 0; close(f) }'
+}
+
+# --- informacje o certyfikacie (jedno wywołanie openssl na certyfikat, wynik w tablicach) ---
+declare -A I_SUBJ=() I_ISS=() I_SKI=() I_AKI=() I_START=() I_END=() I_ENDTS=() I_STARTTS=() I_FP=() \
+           I_SER=() I_SAN=() I_AIA=() I_CA=() I_SIG=() I_KEY=() I_EKU=() I_SELF=()
+load_info() { # plik.pem
+  local f=$1 line prev="" txt
+  [ -n "${I_FP[$f]:-}" ] && return 0
+  txt=$(openssl x509 -in "$f" -noout -nameopt RFC2253 -subject -issuer -serial -startdate -enddate \
+          -fingerprint -sha256 -text 2>/dev/null) || return 1
+  I_SAN[$f]=""; I_AIA[$f]=""; I_SKI[$f]=""; I_AKI[$f]=""; I_CA[$f]=false; I_SIG[$f]=""; I_KEY[$f]=""; I_EKU[$f]=none
+  while IFS= read -r line; do
+    case $line in
+      subject=*)         I_SUBJ[$f]=${line#subject=}; I_SUBJ[$f]=${I_SUBJ[$f]# } ;;
+      issuer=*)          I_ISS[$f]=${line#issuer=};   I_ISS[$f]=${I_ISS[$f]# } ;;
+      serial=*)          I_SER[$f]=${line#serial=} ;;
+      notBefore=*)       I_START[$f]=${line#notBefore=} ;;
+      notAfter=*)        I_END[$f]=${line#notAfter=} ;;
+      *[Ff]ingerprint=*) I_FP[$f]=${line#*=} ;;
+    esac
+    line=${line#"${line%%[![:space:]]*}"}
+    case $prev in
+      "X509v3 Subject Key Identifier:"*)    I_SKI[$f]=${line^^} ;;
+      "X509v3 Authority Key Identifier:"*)  I_AKI[$f]=${line#keyid:}; I_AKI[$f]=${I_AKI[$f]^^} ;;
+      "X509v3 Subject Alternative Name:"*)  I_SAN[$f]=$line ;;
+      "X509v3 Extended Key Usage:"*)        if [[ $line == *"TLS Web Server Authentication"* ]]; then I_EKU[$f]=yes; else I_EKU[$f]=no; fi ;;
+    esac
+    case $line in
+      "CA Issuers - URI:"*)                 [ -z "${I_AIA[$f]}" ] && I_AIA[$f]=${line#CA Issuers - URI:} ;;
+      "CA:TRUE"*)                           I_CA[$f]=true ;;
+      "Signature Algorithm:"*)              [ -z "${I_SIG[$f]}" ] && I_SIG[$f]=${line#Signature Algorithm: } ;;
+      *"Public-Key: ("*)                    I_KEY[$f]=${line#*(}; I_KEY[$f]=${I_KEY[$f]%)*} ;;
+    esac
+    prev=$line
+  done <<< "$txt"
+  I_ENDTS[$f]=$(date -d "${I_END[$f]}" +%s 2>/dev/null || echo 0)
+  I_STARTTS[$f]=$(date -d "${I_START[$f]}" +%s 2>/dev/null || echo 0)
+  if [ "${I_SUBJ[$f]}" = "${I_ISS[$f]}" ] && { [ -z "${I_AKI[$f]}" ] || [ "${I_AKI[$f]}" = "${I_SKI[$f]}" ]; }; then
+    I_SELF[$f]=true
+  else
+    I_SELF[$f]=false
+  fi
+}
+cn_of() { local c=${I_SUBJ[$1]#*CN=}; [ "$c" = "${I_SUBJ[$1]}" ] && c=${I_SUBJ[$1]}; echo "${c%%,*}"; }
+# czy $2 jest wystawcą $1 (nazwa + identyfikator klucza)
+issued_by() {
+  [ "${I_ISS[$1]}" = "${I_SUBJ[$2]}" ] || return 1
+  [ -z "${I_AKI[$1]}" ] || [ -z "${I_SKI[$2]}" ] || [ "${I_AKI[$1]}" = "${I_SKI[$2]}" ]
+}
+fmt_date() { date -d "$1" '+%F' 2>/dev/null || echo "$1"; }
+save_cert() { # plik nazwa -> ścieżka zapisanego PEM
+  local dst
+  mkdir -p "$OUT_DIR"
+  dst="$OUT_DIR/$(tr -c 'A-Za-z0-9._-' '_' <<< "$2" | sed 's/_*$//').pem"
+  openssl x509 -in "$1" -out "$dst" 2>/dev/null
+  echo "$dst"
+}
+
+# ---------------------------------------------------------------------------
+hdr "1. Cel i środowisko"
+echo "  Adres:      $HOST  port $PORT${STARTTLS:+  (STARTTLS $STARTTLS)}"
+echo "  SNI:        ${SNI:-brak (adres IP)}   weryfikowana nazwa: $VERIFY_NAME"
+echo "  Bundle CA:  $CAFILE"
+echo "  Klient:     $OSSL_VER   system: $(cat /etc/redhat-release 2>/dev/null || uname -sr)"
+if command -v update-crypto-policies >/dev/null; then
+  POLICY=$(update-crypto-policies --show 2>/dev/null)
+  echo "  Polityka:   crypto-policies $POLICY"
+fi
+[ -n "$PROXY" ] && echo "  Proxy:      $PROXY"
+
+if [ "$CAFILE" = /etc/pki/tls/certs/ca-bundle.crt ] && [ ! -L "$CAFILE" ]; then
+  bad "$CAFILE nie jest symlinkiem - update-ca-trust go nie aktualizuje"
+  CLIENT_FIX+=("Napraw pliki ca-trust: ./ca_trust_fix.yml -S")
+fi
+ENV_PROXY=${https_proxy:-${HTTPS_PROXY:-}}
+if [ -n "$ENV_PROXY" ] && [ -z "$PROXY" ]; then
+  note "Ustawione https_proxy=$ENV_PROXY - aplikacje (curl, dnf) pójdą przez proxy, a ten test łączy się"
+  note "bezpośrednio. Żeby przetestować drogę przez proxy: -x ${ENV_PROXY#*://}"
+fi
+if command -v timedatectl >/dev/null; then
+  if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = no ]; then
+    wrn "Zegar systemowy nie jest zsynchronizowany z NTP ($(date '+%F %T')) - może psuć weryfikację dat"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+hdr "2. DNS i TCP"
+IPS=()
+if [ -n "$PROXY" ]; then
+  note "Przez proxy - nazwę rozwiązuje proxy, sprawdzam tylko połączenie z proxy"
+  ph=${PROXY%:*}; pp=${PROXY##*:}
+  if timeout "$TO" bash -c 'exec 3<>/dev/tcp/$0/$1' "$ph" "$pp" 2>/dev/null; then
+    ok "Proxy $PROXY odpowiada"
+  else
+    bad "Brak połączenia z proxy $PROXY"; exit 2
+  fi
+elif is_ip "$HOST"; then
+  IPS=("$HOST")
+  note "Podano adres IP - bez DNS"
+else
+  mapfile -t IPS < <(getent ahosts "$HOST" 2>/dev/null | awk '{print $1}' | awk '!seen[$0]++')
+  if [ ${#IPS[@]} -eq 0 ]; then
+    bad "Nazwa $HOST nie rozwiązuje się (getent ahosts)"
+    note "Sprawdź: /etc/resolv.conf, /etc/hosts, nslookup $HOST"
+    exit 2
+  fi
+  ok "$HOST -> ${IPS[*]}"
+  grep -qwE "^[^#]*[[:space:]]$HOST([[:space:]]|$)" /etc/hosts 2>/dev/null && note "Wpis dla $HOST jest w /etc/hosts (ma pierwszeństwo przed DNS)"
+fi
+
+REACHABLE=()
+for ip in "${IPS[@]}"; do
+  err=$(timeout "$TO" bash -c 'exec 3<>/dev/tcp/$0/$1' "$ip" "$PORT" 2>&1); rc=$?
+  if [ $rc -eq 0 ]; then
+    ok "TCP $(hostport "$ip" "$PORT") - połączenie nawiązane"
+    REACHABLE+=("$ip")
+  elif [ $rc -eq 124 ]; then
+    bad "TCP $(hostport "$ip" "$PORT") - TIMEOUT (firewall po drodze gubi pakiety, zły adres albo trzeba iść przez proxy)"
+  else
+    bad "TCP $(hostport "$ip" "$PORT") - ${err##*: } (nic nie słucha na porcie albo firewall odrzuca)"
+  fi
+done
+if [ -z "$PROXY" ] && [ ${#REACHABLE[@]} -eq 0 ]; then
+  echo
+  bad "Żaden adres nie przyjmuje połączeń TCP na porcie $PORT - to nie jest problem certyfikatów."
+  note "Sprawdź: firewall (firewall-cmd --list-all po stronie serwera), routing, czy usługa działa (ss -tlnp na serwerze)"
+  exit 2
+fi
+[ ${#REACHABLE[@]} -lt ${#IPS[@]} ] && SERVER_FIX+=("Nie wszystkie adresy $HOST przyjmują połączenia na porcie $PORT - sprawdź węzły/LB")
+
+# ---------------------------------------------------------------------------
+hdr "3. Handshake TLS"
+TARGET=$HOST
+[ -z "$PROXY" ] && TARGET=${REACHABLE[0]}
+BASE_ARGS=()
+[ -n "$SNI" ] && BASE_ARGS+=(-servername "$SNI")
+MAIN_ARGS=("${BASE_ARGS[@]}" -showcerts -CAfile "$CAFILE")
+if is_ip "$VERIFY_NAME"; then
+  has_opt verify_ip && MAIN_ARGS+=(-verify_ip "$VERIFY_NAME")
+else
+  has_opt verify_hostname && MAIN_ARGS+=(-verify_hostname "$VERIFY_NAME")
+fi
+[ -z "$PROXY" ] && [ "$TARGET" != "$HOST" ] && note "Łączę się z $TARGET (pierwszy osiągalny adres $HOST)"
+OUT=$(sclient "$TARGET" "${MAIN_ARGS[@]}"); MAIN_RC=$?
+
+# Co działa, a co nie - wersje protokołu (wynik orientacyjny: TLS 1.0/1.1 próbowane z @SECLEVEL=0)
+probe_versions() {
+  local v name args out res=()
+  for v in tls1_3 tls1_2 tls1_1 tls1; do
+    has_opt "$v" || continue
+    args=("${BASE_ARGS[@]}" "-$v")
+    case $v in tls1|tls1_1) args+=(-cipher 'DEFAULT:@SECLEVEL=0') ;; esac
+    out=$(sclient "$TARGET" "${args[@]}")
+    name=${v/tls/TLS }; name=${name/_/.}; [ "$name" = "TLS 1" ] && name="TLS 1.0"
+    if handshake_ok "$out"; then
+      res+=("${name}: ${GRN}tak${RST}"); SUPPORTED+=("$v")
+    elif grep -qE 'invalid digest|EVP lib' <<< "$out" && grep -qE '^ *Protocol *: *TLSv1(\.1)?$' <<< "$out"; then
+      res+=("${name}: ${YEL}serwer tak, klient odrzuca (SHA1/MD5)${RST}"); SUPPORTED+=("$v"); BLOCKED_OLD=true
+    else
+      res+=("${name}: nie")
+    fi
+  done
+  echo "  Wersje obsługiwane przez serwer: ${res[*]}"
+}
+SUPPORTED=()
+BLOCKED_OLD=false
+
+if handshake_ok "$OUT"; then
+  PROTO=$(sed -n 's/^ *Protocol *: *//p' <<< "$OUT" | head -1)
+  [ -z "$PROTO" ] && PROTO=$(sed -n 's/^New, \([^,]*\), Cipher.*/\1/p' <<< "$OUT" | head -1)
+  CIPHER=$(sed -n 's/^New, [^,]*, Cipher is //p' <<< "$OUT" | head -1)
+  ok "Handshake udany: ${PROTO:-?}, szyfr $CIPHER"
+  probe_versions
+  if printf '%s\n' "${SUPPORTED[@]}" | grep -qxE 'tls1|tls1_1'; then
+    NOTES+=("Serwer akceptuje przestarzałe TLS 1.0/1.1 - warto je wyłączyć")
+  fi
+  if grep -qE 'Acceptable client certificate CA names|Client Certificate Types' <<< "$OUT"; then
+    wrn "Serwer prosi o certyfikat klienta (mTLS). Akceptowani wystawcy certyfikatu klienta:"
+    sed -n '/Acceptable client certificate CA names/,/^\(Requested\|Client Certificate Types\|Peer\|Server Temp\|---\)/p' <<< "$OUT" \
+      | sed '1d;$d' | sed 's/^/          /' | head -10
+    NOTES+=("Serwer żąda certyfikatu klienta - aplikacja musi mieć certyfikat klienta wystawiony przez jedno z powyższych CA (curl --cert/--key, openssl s_client -cert/-key)")
+  fi
+else
+  bad "Handshake TLS NIE powiódł się"
+  ERRS=$(grep -iE 'error|alert|errno|unexpected eof|reset' <<< "$OUT" | sort -u | head -5)
+  [ -n "$ERRS" ] && sed 's/^/          /' <<< "$ERRS"
+  low=${OUT,,}
+  if [[ $low == *"wrong version number"* || $low == *"packet length too long"* || $low == *"unknown protocol"* ]] \
+     || [ "$MAIN_RC" -eq 124 ]; then
+    if [ "$MAIN_RC" -eq 124 ]; then
+      bad "Serwer nie odpowiedział na ClientHello w ciągu ${TO}s - usługa nie mówi TLS (np. czeka na żądanie HTTP) albo coś po drodze filtruje"
+    else
+      bad "Po drugiej stronie nie ma TLS na tym porcie"
+    fi
+    banner=$(timeout 6 bash -c 'exec 3<>/dev/tcp/$0/$1; if read -t 3 -r l <&3; then echo "BANNER:$l"; exit; fi
+             printf "HEAD / HTTP/1.0\r\n\r\n" >&3; read -t 3 -r l <&3; echo "HTTP:$l"' "$TARGET" "$PORT" 2>/dev/null | tr -d '\r')
+    case $banner in
+      HTTP:HTTP/*)               note "Port odpowiada zwykłym HTTP ($banner) - użyj http:// albo właściwego portu TLS" ;;
+      BANNER:220*)               note "Banner SMTP/FTP ($banner) - spróbuj: -s smtp albo -s ftp" ;;
+      "BANNER:* OK"*)            note "Banner IMAP - spróbuj: -s imap" ;;
+      BANNER:+OK*)               note "Banner POP3 - spróbuj: -s pop3" ;;
+      BANNER:SSH-*)              note "To jest serwer SSH, nie TLS" ;;
+      *)                         note "Odpowiedź: ${banner:-brak}. Możliwe STARTTLS (-s ...) albo inny protokół" ;;
+    esac
+    SERVER_FIX+=("Na porcie $PORT nie działa TLS - sprawdź konfigurację usługi lub właściwy port")
+    exit 2
+  fi
+  if [[ $low == *"certificate required"* ]]; then
+    bad "Serwer wymaga certyfikatu klienta (mTLS) i zerwał połączenie bez niego"
+    CLIENT_FIX+=("Uzyskaj certyfikat klienta i testuj z nim: openssl s_client -connect $(hostport "$HOST" "$PORT") -cert klient.crt -key klient.key")
+  fi
+  [[ $low == *"unrecognized name"* ]] && bad "Serwer nie rozpoznaje nazwy SNI '$SNI' - sprawdź nazwę lub użyj -n" \
+    && SERVER_FIX+=("Serwer nie ma vhosta/certyfikatu dla nazwy '$SNI'")
+  [[ $low == *"unsafe legacy renegotiation"* ]] && bad "Stary serwer bez RFC 5746 (bezpieczna renegocjacja) - OpenSSL 3 domyślnie go odrzuca"
+  [[ $low == *"dh key too small"* ]] && bad "Serwer używa za słabego klucza DH - odrzucony przez politykę klienta"
+  if [[ $low == *"unexpected eof"* || $low == *"connection reset"* || $low == *"errno=104"* ]]; then
+    wrn "Połączenie zerwane w trakcie handshake - możliwy firewall/IPS, proxy TLS albo serwer odrzucający SNI/szyfry"
+  fi
+
+  probe_versions
+  # Co trzeba poluzować po stronie klienta, żeby handshake przeszedł
+  FIXED_BY=""
+  tries=("-cipher DEFAULT:@SECLEVEL=0|obniżenie poziomu bezpieczeństwa szyfrów (@SECLEVEL=0)")
+  has_opt legacy_renegotiation && tries+=("-legacy_renegotiation|zezwolenie na niebezpieczną renegocjację"
+                                          "-legacy_renegotiation -cipher DEFAULT:@SECLEVEL=0|renegocjacja legacy + @SECLEVEL=0")
+  for tr in "${tries[@]}"; do
+    # shellcheck disable=SC2206
+    extra=(${tr%%|*})
+    if handshake_ok "$(sclient "$TARGET" "${BASE_ARGS[@]}" "${extra[@]}")"; then FIXED_BY=${tr#*|}; break; fi
+  done
+  if $BLOCKED_OLD && ! printf '%s\n' "${SUPPORTED[@]}" | grep -qxE 'tls1_2|tls1_3'; then
+    bad "Serwer obsługuje tylko TLS 1.0/1.1, a podpisy SHA1/MD5 wymagane przez te wersje są wyłączone w kliencie"
+    SERVER_FIX+=("Serwer obsługuje tylko TLS 1.0/1.1 - musi zostać zaktualizowany do TLS 1.2+")
+    if [ "${RHEL_MAJOR:-0}" -ge 9 ]; then
+      CLIENT_FIX+=("RHEL 9 nie połączy się z takim serwerem nawet w polityce LEGACY - jedyne wyjście to aktualizacja serwera (ew. pośredniczący proxy TLS na starszym systemie)")
+    elif [ -n "${POLICY:-}" ]; then
+      CLIENT_FIX+=("Obejście dla CAŁEGO systemu (świadomie, tymczasowo): update-crypto-policies --set LEGACY  (wycofanie: --set ${POLICY})")
+    fi
+  elif [ -n "$FIXED_BY" ] || printf '%s\n' "${SUPPORTED[@]}" | grep -qxE 'tls1|tls1_1'; then
+    bad "Handshake działa dopiero po poluzowaniu ustawień klienta: ${FIXED_BY:-przestarzała wersja TLS}"
+    SERVER_FIX+=("Serwer używa przestarzałych ustawień TLS (${FIXED_BY:-TLS 1.0/1.1}) - właściwe rozwiązanie to jego aktualizacja (TLS 1.2+, nowoczesne szyfry, RFC 5746)")
+    if [ -n "${POLICY:-}" ]; then
+      CLIENT_FIX+=("Obejście dla CAŁEGO systemu (świadomie, tymczasowo): update-crypto-policies --set LEGACY  (wycofanie: --set ${POLICY})")
+    fi
+  elif [ ${#SUPPORTED[@]} -eq 0 ]; then
+    bad "Żadna wersja TLS nie działa - prawdopodobnie usługa nie mówi TLS, wymaga mTLS albo coś po drodze zrywa połączenie"
+  fi
+  echo
+  hdr "Diagnoza"
+  for f in "${SERVER_FIX[@]}"; do echo "  serwer: $f"; done
+  for f in "${CLIENT_FIX[@]}"; do echo "  klient: $f"; done
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+hdr "4. Łańcuch certyfikatów wysłany przez serwer"
+mkdir -p "$WORK/chain" "$WORK/bundle" "$WORK/aia"
+split_pem "$WORK/chain" c_ <<< "$OUT"
+CHAIN=("$WORK"/chain/c_*.pem)
+[ -e "${CHAIN[0]}" ] || { bad "Serwer nie wysłał certyfikatu"; exit 2; }
+LEAF=${CHAIN[0]}
+for f in "${CHAIN[@]}"; do load_info "$f"; done
+
+i=0
+for f in "${CHAIN[@]}"; do
+  days=$(( (I_ENDTS[$f] - NOW) / 86400 ))
+  role="pośredni"; [ $i -eq 0 ] && role="serwera"; ${I_SELF[$f]} && [ $i -gt 0 ] && role="root"
+  echo
+  echo "  ${BLD}[$i] $role:${RST} ${I_SUBJ[$f]}"
+  echo "      wystawca: ${I_ISS[$f]}"
+  if [ "${I_ENDTS[$f]}" -le "$NOW" ]; then st="${RED}WYGASŁ $(( -days )) dni temu${RST}"
+  elif [ "${I_STARTTS[$f]}" -gt "$NOW" ]; then st="${RED}JESZCZE NIEWAŻNY${RST}"
+  elif [ "$days" -le "$DAYS_WARNING" ]; then st="${YEL}wygasa za $days dni${RST}"
+  else st="${GRN}jeszcze $days dni${RST}"; fi
+  echo "      ważny:    $(fmt_date "${I_START[$f]}") → $(fmt_date "${I_END[$f]}")  ($st)"
+  [ $i -eq 0 ] && echo "      SAN:      ${I_SAN[$f]:-${RED}brak${RST}}"
+  echo "      klucz:    ${I_KEY[$f]:-?}, podpis ${I_SIG[$f]:-?}"
+  echo "      SHA256:   ${I_FP[$f]}"
+  [ -n "${I_AIA[$f]}" ] && echo "      AIA:      ${I_AIA[$f]}"
+  i=$((i + 1))
+done
+echo
+
+# kolejność: każdy certyfikat powinien być wystawiony przez następny
+for ((i = 0; i < ${#CHAIN[@]} - 1; i++)); do
+  if ! issued_by "${CHAIN[$i]}" "${CHAIN[$((i + 1))]}"; then
+    wrn "Certyfikat [$((i + 1))] nie jest wystawcą [$i] - zła kolejność lub zbędny certyfikat w łańcuchu"
+    SERVER_FIX+=("Popraw kolejność łańcucha: serwer -> pośredni -> (opcjonalnie) root")
+    break
+  fi
+done
+if [ ${#CHAIN[@]} -eq 1 ] && ! ${I_SELF[$LEAF]}; then
+  note "Serwer wysyła tylko swój certyfikat, bez pośrednich"
+fi
+
+# daty, przeznaczenie, siła kryptograficzna
+if [ "${I_ENDTS[$LEAF]}" -le "$NOW" ]; then
+  bad "Certyfikat serwera WYGASŁ $(fmt_date "${I_END[$LEAF]}")"
+  SERVER_FIX+=("Odnów certyfikat serwera (wygasł $(fmt_date "${I_END[$LEAF]}"))"); CERT_PROBLEMS=$((CERT_PROBLEMS + 1))
+elif [ "${I_STARTTS[$LEAF]}" -gt "$NOW" ]; then
+  bad "Certyfikat serwera ważny dopiero od $(fmt_date "${I_START[$LEAF]}") - sprawdź zegar tego hosta (teraz: $(date '+%F %T'))"
+  CLIENT_FIX+=("Sprawdź czas systemowy: timedatectl; chronyc tracking"); CERT_PROBLEMS=$((CERT_PROBLEMS + 1))
+elif [ $(( (I_ENDTS[$LEAF] - NOW) / 86400 )) -le "$DAYS_WARNING" ]; then
+  wrn "Certyfikat serwera wygasa za $(( (I_ENDTS[$LEAF] - NOW) / 86400 )) dni"
+  SERVER_FIX+=("Zaplanuj odnowienie certyfikatu serwera (wygasa $(fmt_date "${I_END[$LEAF]}"))")
+fi
+for f in "${CHAIN[@]:1}"; do
+  if [ "${I_ENDTS[$f]}" -le "$NOW" ]; then
+    bad "Wygasły certyfikat CA w łańcuchu serwera: $(cn_of "$f")"
+    SERVER_FIX+=("Wymień wygasły certyfikat pośredni '$(cn_of "$f")' w konfiguracji serwera na aktualny"); CERT_PROBLEMS=$((CERT_PROBLEMS + 1))
+  fi
+done
+if [ "${I_EKU[$LEAF]}" = no ]; then
+  bad "Certyfikat serwera nie ma przeznaczenia 'TLS Web Server Authentication' (Extended Key Usage)"
+  SERVER_FIX+=("Wystaw certyfikat z EKU serverAuth"); CERT_PROBLEMS=$((CERT_PROBLEMS + 1))
+fi
+for f in "${CHAIN[@]}"; do
+  ${I_SELF[$f]} && [ "$f" != "$LEAF" ] && continue   # podpis roota nie ma znaczenia
+  if [[ ${I_SIG[$f],,} == *sha1* || ${I_SIG[$f],,} == *md5* ]]; then
+    bad "Słaby podpis ${I_SIG[$f]}: $(cn_of "$f") - RHEL 9 (DEFAULT) to odrzuca"
+    SERVER_FIX+=("Wymień certyfikat '$(cn_of "$f")' podpisany ${I_SIG[$f]} na SHA-256+"); CERT_PROBLEMS=$((CERT_PROBLEMS + 1))
+  fi
+  bits=${I_KEY[$f]%% *}
+  if [[ $bits =~ ^[0-9]+$ ]] && [ "$bits" -lt 2048 ] && [ "$bits" -gt 521 ]; then
+    bad "Za krótki klucz RSA ($bits bit): $(cn_of "$f")"
+    SERVER_FIX+=("Wymień certyfikat '$(cn_of "$f")' na klucz RSA >= 2048 bit"); CERT_PROBLEMS=$((CERT_PROBLEMS + 1))
+  fi
+done
+
+# nazwa hosta
+if is_ip "$VERIFY_NAME"; then
+  chk=$(openssl x509 -in "$LEAF" -noout -checkip "$VERIFY_NAME" 2>/dev/null)
+else
+  chk=$(openssl x509 -in "$LEAF" -noout -checkhost "$VERIFY_NAME" 2>/dev/null)
+fi
+if [[ $chk == *"does match"* ]]; then
+  ok "Nazwa '$VERIFY_NAME' zgodna z certyfikatem"
+  [ -z "${I_SAN[$LEAF]}" ] && wrn "Brak SAN - zgodność tylko przez CN; Go, Chrome, nowsze Javy i Python tego nie akceptują" \
+    && SERVER_FIX+=("Wystaw certyfikat z rozszerzeniem SAN zawierającym $VERIFY_NAME")
+else
+  bad "Nazwa '$VERIFY_NAME' NIE pasuje do certyfikatu (SAN: ${I_SAN[$LEAF]:-brak}, CN: $(cn_of "$LEAF"))"
+  SERVER_FIX+=("Certyfikat serwera musi zawierać '$VERIFY_NAME' w SAN - albo klient musi używać nazwy z certyfikatu")
+  CERT_PROBLEMS=$((CERT_PROBLEMS + 1))
+fi
+
+# ---------------------------------------------------------------------------
+hdr "5. Zaufanie: czy da się zbudować ścieżkę do zaufanego CA"
+VCODE=$(sed -n 's/^ *Verify return code: \([0-9]*\).*/\1/p' <<< "$OUT" | tail -1)
+VTEXT=$(sed -n 's/^ *Verify return code: [0-9]* (\(.*\))/\1/p' <<< "$OUT" | tail -1)
+explain() {
+  case $1 in
+    2)  echo "brak certyfikatu wystawcy - łańcuch się urywa" ;;
+    9)  echo "certyfikat jeszcze nieważny - zegar?" ;;
+    10) echo "certyfikat w łańcuchu wygasł" ;;
+    18) echo "certyfikat serwera jest samopodpisany" ;;
+    19) echo "w łańcuchu jest root CA, którego nie ma w zaufanym bundlu" ;;
+    20) echo "nie ma wystawcy w zaufanym bundlu (brak root lub pośredniego CA)" ;;
+    21) echo "nie da się zweryfikować certyfikatu serwera - zwykle serwer nie wysyła certyfikatu pośredniego" ;;
+    24) echo "certyfikat CA bez CA:TRUE" ;;
+    26) echo "certyfikat nie jest przeznaczony do uwierzytelniania serwera" ;;
+    62) echo "nazwa hosta nie zgadza się z certyfikatem" ;;
+    64) echo "adres IP nie zgadza się z certyfikatem" ;;
+    66|67) echo "za krótki klucz" ;;
+    68) echo "za słaby algorytm podpisu (SHA1/MD5)" ;;
+    *)  echo "" ;;
+  esac
+}
+if [ "$VCODE" = 0 ]; then
+  ok "openssl: weryfikacja poprawna (Verify return code: 0)"
+else
+  bad "openssl: Verify return code: $VCODE ($VTEXT) - $(explain "$VCODE")"
+  while read -r num txt; do
+    [ "$num" = "$VCODE" ] && continue
+    note "też: błąd $num ($txt) $(explain "$num")"
+  done < <(sed -n 's/.*verify error:num=\([0-9]*\):\(.*\)/\1 \2/p' <<< "$OUT" | sort -u)
+fi
+
+# Indeks bundla po subject
+declare -A B_BY_SUBJ=() B_FP=()
+split_pem "$WORK/bundle" b_ < "$CAFILE"
+for f in "$WORK"/bundle/b_*.pem; do
+  [ -e "$f" ] || continue
+  info=$(openssl x509 -in "$f" -noout -nameopt RFC2253 -subject -fingerprint -sha256 2>/dev/null) || continue
+  s=$(sed -n 's/^subject= *//p' <<< "$info"); fp=$(sed -n 's/^[Ss][Hh][Aa]256 Fingerprint=//p' <<< "$info")
+  B_BY_SUBJ[$s]+="$f "; B_FP[$fp]=1
+done
+note "W bundlu certyfikatów CA: ${#B_FP[@]}"
+
+fetch_aia() { # certyfikat -> plik wystawcy w AIA_OUT (bez podpowłoki, żeby load_info zostało w tablicach)
+  local url=${I_AIA[$1]} raw out n
+  AIA_OUT=""
+  [ -n "$url" ] && $FETCH_AIA || return 1
+  n=$(ls "$WORK/aia" | wc -l)
+  raw="$WORK/aia/raw_$n"; out="$WORK/aia/a_$n.pem"
+  if command -v curl >/dev/null; then
+    curl -fsSL --max-time "$TO" -o "$raw" "$url" 2>/dev/null || return 1
+  elif command -v wget >/dev/null; then
+    wget -q -T "$TO" -O "$raw" "$url" || return 1
+  else
+    return 1
+  fi
+  openssl x509 -in "$raw" -out "$out" 2>/dev/null \
+    || openssl x509 -inform DER -in "$raw" -out "$out" 2>/dev/null \
+    || { openssl pkcs7 -inform DER -in "$raw" -print_certs 2>/dev/null | split_pem "$WORK/aia" "p${n}_"
+         out=$(ls "$WORK"/aia/p"${n}"_*.pem 2>/dev/null | head -1); [ -n "$out" ]; } || return 1
+  load_info "$out" || return 1
+  AIA_OUT=$out
+}
+
+# Budowanie ścieżki: bundel ma pierwszeństwo, potem certyfikaty od serwera, na końcu AIA
+PATH_CERTS=("$LEAF"); PATH_SRC=("serwer")
+TO_ADD=()          # certyfikaty do dodania do anchors
+MISSING_INTER=()   # pośrednie, których serwer nie wysyła
+UNKNOWN=""         # nie udało się ustalić wystawcy
+TRUSTED=false
+cur=$LEAF
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if [ -n "${B_FP[${I_FP[$cur]}]:-}" ] && [ "$cur" != "$LEAF" ]; then TRUSTED=true; break; fi
+  if ${I_SELF[$cur]}; then
+    if [ -n "${B_FP[${I_FP[$cur]}]:-}" ]; then TRUSTED=true; else TO_ADD+=("$cur"); fi
+    break
+  fi
+  next=""
+  # 1) bundel
+  for b in ${B_BY_SUBJ[${I_ISS[$cur]}]:-}; do
+    load_info "$b"
+    if issued_by "$cur" "$b"; then
+      if [ "${I_ENDTS[$b]}" -le "$NOW" ]; then
+        bad "W bundlu jest WYGASŁA wersja wystawcy: $(cn_of "$b") (ważny do $(fmt_date "${I_END[$b]}"))"
+        CLIENT_FIX+=("Sprawdź wersje CA '$(cn_of "$b")' w bundlu: ./ca_trust_info.yml \"$(cn_of "$b")\"")
+        continue
+      fi
+      next=$b; src="bundel"; break
+    fi
+  done
+  if [ -z "$next" ] && [ -n "${B_BY_SUBJ[${I_ISS[$cur]}]:-}" ]; then
+    wrn "W bundlu jest CA o nazwie '${I_ISS[$cur]}', ale z innym kluczem - to inna (np. starsza) wersja tego CA"
+    CLIENT_FIX+=("Porównaj wersje CA: ./ca_trust_info.yml \"${I_ISS[$cur]#CN=}\" - potrzebna jest ta z keyid ${I_AKI[$cur]}")
+  fi
+  # 2) certyfikaty wysłane przez serwer
+  if [ -z "$next" ]; then
+    for c in "${CHAIN[@]:1}"; do
+      if issued_by "$cur" "$c"; then next=$c; src="serwer"; break; fi
+    done
+  fi
+  # 3) AIA
+  if [ -z "$next" ]; then
+    if fetch_aia "$cur" && issued_by "$cur" "$AIA_OUT"; then
+      next=$AIA_OUT; src="AIA"
+      ${I_SELF[$next]} || MISSING_INTER+=("$next")
+    fi
+  fi
+  if [ -z "$next" ]; then UNKNOWN=$cur; break; fi
+  PATH_CERTS+=("$next"); PATH_SRC+=("$src")
+  cur=$next
+done
+
+echo
+echo "  Ścieżka zaufania:"
+for ((i = 0; i < ${#PATH_CERTS[@]}; i++)); do
+  f=${PATH_CERTS[$i]}
+  case ${PATH_SRC[$i]} in
+    bundel) where="${GRN}w bundlu (zaufany)${RST}" ;;
+    serwer) where="wysłany przez serwer" ;;
+    AIA)    where="${YEL}NIE wysłany przez serwer - pobrany z AIA${RST}" ;;
+  esac
+  printf "    %s%s  [%s]\n" "$(printf '%*s' $((i * 2)) '')" "$(cn_of "$f")" "$where"
+done
+if [ -n "$UNKNOWN" ]; then
+  printf "    %s%s  [%s]\n" "$(printf '%*s' $((${#PATH_CERTS[@]} * 2)) '')" "${I_ISS[$UNKNOWN]}" "${RED}BRAK - nie wiadomo skąd go wziąć${RST}"
+fi
+echo
+
+if [ ${#MISSING_INTER[@]} -gt 0 ]; then
+  names=""
+  for a in "${MISSING_INTER[@]}"; do
+    bad "Serwer nie wysyła certyfikatu pośredniego: $(cn_of "$a")"
+    names+="${names:+, }'$(cn_of "$a")'"
+  done
+  SERVER_FIX+=("Skonfiguruj na serwerze pełny łańcuch: certyfikat + pośrednie $names (fullchain.pem / SSLCertificateChainFile / keystore z całym łańcuchem)")
+  CERT_PROBLEMS=$((CERT_PROBLEMS + 1))
+fi
+if ${I_SELF[$LEAF]}; then
+  bad "Certyfikat serwera jest samopodpisany - nie pochodzi z żadnego CA"
+  SERVER_FIX+=("Docelowo wystaw serwerowi certyfikat z firmowego/publicznego CA")
+  CERT_PROBLEMS=$((CERT_PROBLEMS + 1))
+fi
+for c in "${TO_ADD[@]}"; do
+  [ "$c" = "$LEAF" ] && continue
+  bad "Root CA '$(cn_of "$c")' nie jest zaufany na tym hoście (nie ma go w $CAFILE)"
+  CERT_PROBLEMS=$((CERT_PROBLEMS + 1))
+done
+if [ -n "$UNKNOWN" ]; then
+  bad "Nie udało się ustalić wystawcy: ${I_ISS[$UNKNOWN]}"
+  echo "        keyid wystawcy (AKI): ${I_AKI[$UNKNOWN]:-brak}"
+  if [ -z "${I_AIA[$UNKNOWN]}" ]; then echo "        certyfikat nie ma adresu AIA - trzeba go zdobyć od zespołu PKI / właściciela serwera"
+  elif ! $FETCH_AIA; then echo "        pobieranie z AIA wyłączone (-N): ${I_AIA[$UNKNOWN]}"
+  else echo "        nie udało się pobrać: ${I_AIA[$UNKNOWN]} (brak dostępu do sieci/proxy?)"; fi
+  CLIENT_FIX+=("Zdobądź certyfikat CA '${I_ISS[$UNKNOWN]}' (keyid ${I_AKI[$UNKNOWN]:-?}) i jego root, zweryfikuj fingerprint z zespołem PKI, wgraj do $ANCHORS i uruchom update-ca-trust extract")
+  CERT_PROBLEMS=$((CERT_PROBLEMS + 1))
+fi
+
+# Co dodać po stronie klienta i czy to wystarczy
+ADD_FILES=()
+if ! $TRUSTED && [ -z "$UNKNOWN" ]; then
+  if ${I_SELF[$LEAF]}; then
+    ADD_FILES+=("$(save_cert "$LEAF" "server_selfsigned_$(cn_of "$LEAF")")")
+  else
+    for c in "${TO_ADD[@]}"; do ADD_FILES+=("$(save_cert "$c" "root_$(cn_of "$c")")"); done
+  fi
+fi
+if [ ${#MISSING_INTER[@]} -gt 0 ]; then
+  for a in "${MISSING_INTER[@]}"; do ADD_FILES+=("$(save_cert "$a" "intermediate_$(cn_of "$a")")"); done
+fi
+if [ ${#ADD_FILES[@]} -gt 0 ]; then
+  cat "$CAFILE" "${ADD_FILES[@]}" > "$WORK/test-bundle.pem"
+  for c in "${CHAIN[@]:1}"; do cat "$c"; done > "$WORK/untrusted.pem"
+  vargs=(-CAfile "$WORK/test-bundle.pem")
+  [ -s "$WORK/untrusted.pem" ] && vargs+=(-untrusted "$WORK/untrusted.pem")
+  vres=$(openssl verify "${vargs[@]}" "$LEAF" 2>&1 | tail -1)
+  if [[ $vres == *": OK" ]]; then
+    ok "Symulacja: po dodaniu certyfikatów z $OUT_DIR weryfikacja przechodzi"
+    for f in "${ADD_FILES[@]}"; do
+      load_info "$f"
+      case $f in
+        */intermediate_*) why="obejście - właściwa naprawa: pełny łańcuch na serwerze" ;;
+        *)                why="SHA256 ${I_FP[$f]:0:23}..." ;;
+      esac
+      CLIENT_FIX+=("cp '$f' $ANCHORS/   # $(cn_of "$f"), $why")
+    done
+    CLIENT_FIX+=("update-ca-trust extract")
+    CLIENT_FIX+=("Przed wgraniem potwierdź fingerprint CA z zespołem PKI (certyfikat pochodzi z sieci)")
+  else
+    case ${vres,,} in
+      *"evp lib"*|*"md too weak"*|*"invalid digest"*) vres="podpis SHA1/MD5 odrzucony przez politykę crypto tego systemu" ;;
+      *expired*)                                     vres="certyfikat w łańcuchu wygasł" ;;
+    esac
+    wrn "Symulacja: nawet po dodaniu certyfikatów weryfikacja nie przechodzi - $vres"
+    note "Najpierw trzeba usunąć problemy po stronie serwera (lista niżej)"
+  fi
+elif $TRUSTED && [ "$VCODE" = 0 ]; then
+  ok "Wystawca jest w bundlu - po stronie zaufania nic nie trzeba robić"
+fi
+
+# ---------------------------------------------------------------------------
+hdr "6. Druga strona: spójność odpowiedzi serwera"
+LEAF_FP=${I_FP[$LEAF]}
+if [ -n "$PROXY" ]; then
+  note "Test przez proxy - pomijam porównanie adresów IP"
+elif [ ${#REACHABLE[@]} -gt 1 ]; then
+  diff=0
+  for ip in "${REACHABLE[@]:0:8}"; do
+    o=$(sclient "$ip" "${BASE_ARGS[@]}" -CAfile "$CAFILE")
+    mkdir -p "$WORK/ip"; rm -f "$WORK"/ip/*
+    split_pem "$WORK/ip" x_ <<< "$o"
+    if [ -e "$WORK/ip/x_01.pem" ]; then
+      fp=$(openssl x509 -in "$WORK/ip/x_01.pem" -noout -fingerprint -sha256 | cut -d= -f2)
+      end=$(openssl x509 -in "$WORK/ip/x_01.pem" -noout -enddate | cut -d= -f2)
+      vc=$(sed -n 's/^ *Verify return code: \([0-9]*\).*/\1/p' <<< "$o" | tail -1)
+      if [ "$fp" = "$LEAF_FP" ]; then mark="${GRN}ten sam${RST}"; else mark="${RED}INNY${RST}"; diff=$((diff + 1)); fi
+      printf "    %-40s certyfikat: %b  ważny do %s  verify=%s\n" "$ip" "$mark" "$(fmt_date "$end")" "$vc"
+    else
+      printf "    %-40s ${RED}handshake nieudany${RST}\n" "$ip"; diff=$((diff + 1))
+    fi
+  done
+  if [ $diff -gt 0 ]; then
+    bad "Adresy $HOST zwracają różne certyfikaty lub nie wszystkie działają - błąd 'raz działa, raz nie'"
+    SERVER_FIX+=("Ujednolić certyfikat/łańcuch na wszystkich węzłach za $HOST (${REACHABLE[*]})")
+    CERT_PROBLEMS=$((CERT_PROBLEMS + 1))
+  else
+    ok "Wszystkie adresy zwracają ten sam certyfikat"
+  fi
+else
+  note "Jeden adres - brak porównania między węzłami"
+fi
+
+if [ -n "$SNI" ]; then
+  noargs=()
+  has_opt noservername && noargs=(-noservername)
+  o=$(sclient "$TARGET" "${noargs[@]}")
+  rm -rf "$WORK/nosni"; mkdir -p "$WORK/nosni"
+  split_pem "$WORK/nosni" n_ <<< "$o"
+  if [ -e "$WORK/nosni/n_01.pem" ]; then
+    load_info "$WORK/nosni/n_01.pem"
+    if [ "${I_FP[$WORK/nosni/n_01.pem]}" = "$LEAF_FP" ]; then
+      ok "Bez SNI serwer zwraca ten sam certyfikat"
+    else
+      wrn "Bez SNI serwer zwraca INNY certyfikat: ${I_SUBJ[$WORK/nosni/n_01.pem]}"
+      NOTES+=("Klienci bez SNI (stara Java/biblioteki, połączenia po IP) dostaną certyfikat '$(cn_of "$WORK/nosni/n_01.pem")' zamiast właściwego")
+    fi
+  else
+    note "Bez SNI serwer nie zestawia TLS - klient musi wysyłać SNI ($SNI)"
+  fi
+fi
+
+if $HTTP_TEST && command -v curl >/dev/null; then
+  hdr "7. Test HTTP (curl, ten sam bundle)"
+  cargs=(-sS -o /dev/null --max-time "$TO" --cacert "$CAFILE" -w '%{http_code} %{ssl_verify_result}')
+  [ -n "$PROXY" ] && cargs+=(--proxy "$PROXY")
+  if is_ip "$HOST"; then url="https://$(hostport "$HOST" "$PORT")/"; else url="https://$HOST:$PORT/"; fi
+  if r=$(curl "${cargs[@]}" "$url" 2>&1); then
+    ok "curl $url -> HTTP ${r%% *}"
+  else
+    bad "curl $url -> ${r}"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+hdr "Diagnoza i co zrobić"
+if [ ${#SERVER_FIX[@]} -eq 0 ] && [ ${#CLIENT_FIX[@]} -eq 0 ] && [ "$VCODE" = 0 ] && [ "$CERT_PROBLEMS" -eq 0 ]; then
+  ok "Połączenie TLS z $(hostport "$HOST" "$PORT") jest poprawne i zaufane z tego hosta"
+fi
+if [ ${#CLIENT_FIX[@]} -gt 0 ]; then
+  echo "  ${BLD}Na tym hoście (klient):${RST}"
+  for f in "${CLIENT_FIX[@]}"; do echo "    $f"; done
+  echo
+fi
+if [ ${#SERVER_FIX[@]} -gt 0 ]; then
+  echo "  ${BLD}Po stronie serwera (przekaż właścicielowi usługi):${RST}"
+  printf '%s\n' "${SERVER_FIX[@]}" | awk '!seen[$0]++' | sed 's/^/    - /'
+  echo
+fi
+if [ ${#NOTES[@]} -gt 0 ]; then
+  echo "  ${BLD}Uwagi:${RST}"
+  for f in "${NOTES[@]}"; do echo "    - $f"; done
+  echo
+fi
+if [ ${#ADD_FILES[@]} -gt 0 ]; then
+  echo "  ${BLD}Pamiętaj:${RST} bundle systemowy obsługuje curl, dnf, openssl, python (ssl), wget i Javę"
+  echo "  z /etc/pki/java/cacerts. Własnych truststore'ów nie zmienia: Java z -Djavax.net.ssl.trustStore,"
+  echo "  Python requests/certifi (REQUESTS_CA_BUNDLE), Node.js (NODE_EXTRA_CA_CERTS), kontenery."
+  echo
+fi
+echo "  Ponowny test: $0 $(printf '%q ' "${ORIG_ARGS[@]}" | sed 's/ $//')"
+
+[ "$VCODE" = 0 ] && [ "$CERT_PROBLEMS" -eq 0 ] && exit 0
+exit 1
