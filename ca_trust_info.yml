@@ -10,11 +10,11 @@
 # jako PEM do katalogu -o (przydają się do blokowania certyfikatów systemowych).
 #
 # Użycie:
-#   ./ca_trust_info.sh "CA bko"           # szukaj po nazwie (subject lub issuer, bez wielkości liter)
-#   ./ca_trust_info.sh                    # tylko kontrola plików systemowych
-#   ./ca_trust_info.sh -d 60 bko          # "wygasa wkrótce" = w ciągu 60 dni (domyślnie 30)
-#   ./ca_trust_info.sh -p /etc/httpd -p /opt/app bko   # przeszukaj też inne katalogi/pliki
-#   ./ca_trust_info.sh -o /root/bko bko   # katalog na PEM-y znalezionych certyfikatów
+#   ./ca_trust_info.yml "CA bko"           # szukaj po nazwie (subject lub issuer, bez wielkości liter)
+#   ./ca_trust_info.yml                    # tylko kontrola plików systemowych
+#   ./ca_trust_info.yml -d 60 bko          # "wygasa wkrótce" = w ciągu 60 dni (domyślnie 30)
+#   ./ca_trust_info.yml -p /etc/httpd -p /opt/app bko   # przeszukaj też inne katalogi/pliki
+#   ./ca_trust_info.yml -o /root/bko bko   # katalog na PEM-y znalezionych certyfikatów
 
 set -uo pipefail   # bez -e: grep/openssl/rpm zwracają != 0 w zwykłych sytuacjach
 
