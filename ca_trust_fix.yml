@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+# Naprawa ca-trust na RHEL 7/8/9 - usuwanie wybranych certyfikatów CA i porządkowanie plików
+# systemowych. Uzupełnienie do ca_trust_info.yml (ten sam sposób wyszukiwania po nazwie).
+#
+# Wybór certyfikatów (można łączyć - wybrany jest certyfikat spełniający KTÓRYKOLWIEK warunek;
+# NAZWA, jeśli podana, dodatkowo zawęża wszystko do subject/issuer zawierających ten tekst):
+#   -e          wygasłe
+#   -O          stare: wszystkie wersje danego CA poza najnowszą (po dacie ważności)
+#   -s SERIAL   po numerze seryjnym (hex, np. 7BABA0BE... albo 7b:ab:a0:...; można powtarzać)
+#   -f SHA256   po fingerprincie SHA-256 (można powtarzać)
+#
+# Co się dzieje z wybranym certyfikatem:
+#   - plik admina (/etc/pki/ca-trust/source/...) zawiera tylko wybrane certyfikaty -> plik usuwany
+#   - plik admina zawiera też inne certyfikaty -> wycinany jest tylko wybrany blok
+#   - certyfikat z pakietu RPM -> blokada w blocklist/blacklist (pliku pakietu się nie rusza);
+#     przy -e/-O tylko z opcją -R, przy -s/-f zawsze
+#
+# Inne opcje:
+#   -S          napraw też pliki systemowe (symlinki, kopie bundla w złych miejscach, zły katalog blokad)
+#   -R          blokuj także wygasłe/stare certyfikaty z RPM (dla -e/-O)
+#   -n          dry run - pokaż plan i nic nie zmieniaj
+#   -y          bez pytania o potwierdzenie
+#   -b KATALOG  gdzie zapisać kopię zapasową (domyślnie /root)
+#
+# Usuwane i zmieniane pliki są PRZENOSZONE do katalogu kopii (z zachowaniem ścieżek), a przed
+# zmianami robiony jest tar całego /etc/pki/ca-trust/source i /etc/pki/tls/certs.
+#
+# Przykłady:
+#   ./ca_trust_fix.yml -n -e "CA bko"            # co by zostało usunięte z wygasłych "CA bko"
+#   ./ca_trust_fix.yml -e "CA bko"               # usuń wygasłe "CA bko"
+#   ./ca_trust_fix.yml -O "CA bko"               # zostaw tylko najnowszą wersję "CA bko"
+#   ./ca_trust_fix.yml -s 7BABA0BE91A2C57F96BC0ACD9D948E94D3A7D53B
+#   ./ca_trust_fix.yml -S                        # tylko naprawa plików systemowych
+#   ./ca_trust_fix.yml -S -e -y "CA bko"         # wszystko naraz, bez pytania
+
+set -uo pipefail   # bez -e: grep/openssl/rpm zwracają != 0 w zwykłych sytuacjach
+
+SEL_EXPIRED=false
+SEL_OLD=false
+SERIALS=()
+FPS=()
+FIX_SYSTEM=false
+BLOCK_RPM=false
+DRY_RUN=false
+ASSUME_YES=false
+BACKUP_DIR=/root
+
+SRC_ETC=/etc/pki/ca-trust/source
+SRC_USR=/usr/share/pki/ca-trust-source
+EXTRACTED=/etc/pki/ca-trust/extracted
+TLS_BUNDLE=$EXTRACTED/pem/tls-ca-bundle.pem
+SYSTEM_P11=$SRC_USR/ca-bundle.trust.p11-kit
+
+if [ -t 1 ]; then
+  RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; BLD=$'\e[1m'; RST=$'\e[0m'
+else
+  RED=; GRN=; YEL=; BLD=; RST=
+fi
+
+usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+log()   { echo "[$(date +%H:%M:%S)] $*"; }
+warn()  { echo "[$(date +%H:%M:%S)] ${YEL}UWAGA:${RST} $*" >&2; }
+die()   { echo "[$(date +%H:%M:%S)] ${RED}BŁĄD:${RST} $*" >&2; exit 1; }
+hdr()   { echo; echo "${BLD}=== $* ===${RST}"; }
+
+# Numer seryjny / fingerprint do porównań: wielkie litery, bez ':' i spacji, bez wiodących zer
+norm_serial() { local s=${1^^}; s=${s//[: ]/}; s=${s#0x}; s=${s#0X}; while [[ $s == 0?* ]]; do s=${s#0}; done; echo "$s"; }
+norm_fp()     { local s=${1^^}; echo "${s//[: ]/}"; }
+
+while getopts ":eOs:f:SRnyb:h" opt; do
+  case "$opt" in
+    e) SEL_EXPIRED=true ;;
+    O) SEL_OLD=true ;;
+    s) SERIALS+=("$(norm_serial "$OPTARG")") ;;
+    f) FPS+=("$(norm_fp "$OPTARG")") ;;
+    S) FIX_SYSTEM=true ;;
+    R) BLOCK_RPM=true ;;
+    n) DRY_RUN=true ;;
+    y) ASSUME_YES=true ;;
+    b) BACKUP_DIR=$OPTARG ;;
+    h) usage 0 ;;
+    :) die "Opcja -$OPTARG wymaga argumentu" ;;
+    *) usage 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -le 1 ] || die "Podaj jedną nazwę (w cudzysłowie, jeśli ma spacje)"
+NAME="${1:-}"
+
+SELECTING=false
+if $SEL_EXPIRED || $SEL_OLD || [ ${#SERIALS[@]} -gt 0 ] || [ ${#FPS[@]} -gt 0 ]; then SELECTING=true; fi
+[ -n "$NAME" ] && ! $SELECTING && die "Sama nazwa nie wystarczy - dodaj -e, -O, -s albo -f"
+$SELECTING || $FIX_SYSTEM || die "Nic do zrobienia - podaj -e, -O, -s, -f lub -S (pomoc: -h)"
+
+command -v openssl >/dev/null || die "Brak polecenia openssl"
+$DRY_RUN || [ "$(id -u)" -eq 0 ] || die "Uruchom jako root (albo z -n, żeby tylko zobaczyć plan)"
+
+TS=$(date +%Y%m%d_%H%M%S)
+NOW=$(date +%s)
+BK="$BACKUP_DIR/ca-trust-fix_$TS"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+RHEL_MAJOR=$(sed -n 's/.*release \([0-9]\+\).*/\1/p' /etc/redhat-release 2>/dev/null)
+BLOCK=""
+for d in blocklist blacklist; do
+  if rpm -qf "$SRC_ETC/$d" >/dev/null 2>&1; then BLOCK=$d; break; fi
+done
+if [ -z "$BLOCK" ]; then
+  if [ "${RHEL_MAJOR:-0}" -ge 9 ]; then BLOCK=blocklist; else BLOCK=blacklist; fi
+fi
+OTHER_BLOCK=$([ "$BLOCK" = blocklist ] && echo blacklist || echo blocklist)
+
+# ---------------------------------------------------------------------------
+# Plan: lista operacji "TYP<TAB>arg1<TAB>arg2", wykonywana dopiero po potwierdzeniu
+# ---------------------------------------------------------------------------
+OPS=()
+declare -A OP_SEEN=() TOUCHED=()   # TOUCHED: pliki usuwane/przenoszone przez -S
+add_op() {
+  local op
+  op=$(printf '%s\t' "$@"); op=${op%$'\t'}
+  [ -n "${OP_SEEN[$op]:-}" ] && return
+  OP_SEEN[$op]=1
+  OPS+=("$op")
+}
+
+# ---------------------------------------------------------------------------
+# 1. Naprawa plików systemowych (-S)
+# ---------------------------------------------------------------------------
+plan_link() { # link oczekiwany_cel
+  local l=$1 t=$2
+  if [ -L "$l" ] && [ "$(readlink -f "$l")" = "$(readlink -f "$t")" ]; then return; fi
+  [ -e "$l" ] || [ -L "$l" ] || return
+  add_op LINK "$l" "$t"
+}
+
+if $FIX_SYSTEM; then
+  plan_link /etc/pki/tls/certs/ca-bundle.crt       "$TLS_BUNDLE"
+  plan_link /etc/pki/tls/certs/ca-bundle.trust.crt "$EXTRACTED/openssl/ca-bundle.trust.crt"
+  plan_link /etc/pki/tls/cert.pem                  "$TLS_BUNDLE"
+  plan_link /etc/ssl/certs                         /etc/pki/tls/certs
+  [ -d /etc/pki/java ] && plan_link /etc/pki/java/cacerts "$EXTRACTED/java/cacerts"
+
+  while IFS= read -r f; do
+    [ "$f" = "$SYSTEM_P11" ] && continue
+    add_op REMOVE "$f" "kopia systemowego bundla w złym miejscu"
+    TOUCHED[$f]=1
+  done < <(find /etc/pki /usr/share/pki -name 'ca-bundle.trust.p11-kit*' -type f 2>/dev/null)
+
+  while IFS= read -r f; do
+    [[ "$(basename "$f")" == ca-bundle.trust.p11-kit* ]] && continue   # obsłużone wyżej
+    add_op MOVE "$f" "$SRC_ETC/$BLOCK"
+    TOUCHED[$f]=1
+  done < <(grep -rlE '^x-distrusted: *true' "$SRC_ETC/anchors" 2>/dev/null)
+
+  while IFS= read -r f; do
+    add_op MOVE "$f" "$SRC_ETC/$BLOCK"
+    TOUCHED[$f]=1
+  done < <(find "$SRC_ETC/$OTHER_BLOCK" -maxdepth 1 -type f 2>/dev/null)
+
+  [ -f "$SYSTEM_P11" ] || warn "Brak $SYSTEM_P11 - tego skrypt nie naprawi: dnf reinstall ca-certificates (albo skopiuj plik z hosta z tą samą wersją RHEL)"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Wyszukanie certyfikatów w źródłach ca-trust
+# ---------------------------------------------------------------------------
+# Dzieli plik na fragmenty: każdy fragment to jeden blok PEM razem z tym, co go poprzedza
+# (komentarze, nagłówek obiektu p11-kit). Sklejenie wszystkich fragmentów odtwarza plik.
+chunk_file() { # plik katalog
+  awk -v d="$2" '
+    function next_chunk() { n++; f = sprintf("%s/%05d", d, n); block = 0 }
+    BEGIN { next_chunk() }
+    after_end { next_chunk(); after_end = 0 }
+    /^\[p11-kit-object-v1\]/ && block { next_chunk() }
+    /^-----BEGIN / { block = 1 }
+    { print > f }
+    /^-----END / { after_end = 1; close(f) }
+  ' "$1"
+}
+
+declare -A FP_SUBJ=() FP_ISS=() FP_SER=() FP_SER_RAW=() FP_END=() FP_ENDTS=() FP_PEM=() FP_LOCS=()
+declare -A FILE_DIR=() FILE_NCERT=() FILE_DER=() FILE_KAT=()
+FP_LIST=()
+ENTRIES=()   # "kategoria<TAB>plik<TAB>fragment<TAB>fp<TAB>flaga"
+FILE_ID=0
+
+scan_file() { # plik kategoria
+  local f=$1 kat=$2 d c info line subj iss ser end fp flag
+  FILE_ID=$((FILE_ID + 1))
+  d="$WORK/f$FILE_ID"
+  mkdir -p "$d"
+  if grep -qE -- '-----BEGIN (TRUSTED )?CERTIFICATE-----' "$f" 2>/dev/null; then
+    chunk_file "$f" "$d"
+  elif openssl x509 -inform DER -in "$f" -out "$d/00001" 2>/dev/null; then
+    FILE_DER[$f]=1
+  else
+    return
+  fi
+  FILE_DIR[$f]=$d
+  FILE_KAT[$f]=$kat
+  FILE_NCERT[$f]=0
+  for c in "$d"/*; do
+    grep -qE -- '-----BEGIN (TRUSTED )?CERTIFICATE-----' "$c" || continue
+    info=$(openssl x509 -in "$c" -noout -nameopt RFC2253 -subject -issuer -serial -enddate \
+             -fingerprint -sha256 2>/dev/null) || continue
+    FILE_NCERT[$f]=$(( FILE_NCERT[$f] + 1 ))
+    subj= iss= ser= end= fp=
+    while IFS= read -r line; do
+      case $line in
+        subject=*)         subj=${line#subject=}; subj=${subj# } ;;
+        issuer=*)          iss=${line#issuer=};   iss=${iss# } ;;
+        serial=*)          ser=${line#serial=} ;;
+        notAfter=*)        end=${line#notAfter=} ;;
+        *[Ff]ingerprint=*) fp=${line#*=} ;;
+      esac
+    done <<< "$info"
+    flag=-
+    grep -qE '^x-distrusted: *true' "$c" && flag=distrusted
+    if [ -z "${FP_SUBJ[$fp]:-}" ]; then
+      FP_LIST+=("$fp")
+      FP_SUBJ[$fp]=$subj
+      FP_ISS[$fp]=$iss
+      FP_SER_RAW[$fp]=$ser
+      FP_SER[$fp]=$(norm_serial "$ser")
+      FP_END[$fp]=$end
+      FP_ENDTS[$fp]=$(date -d "$end" +%s 2>/dev/null || echo 0)
+      FP_PEM[$fp]="$WORK/pem_${#FP_LIST[@]}.pem"
+      openssl x509 -in "$c" -out "${FP_PEM[$fp]}" 2>/dev/null
+    fi
+    ENTRIES+=("$kat"$'\t'"$f"$'\t'"$c"$'\t'"$fp"$'\t'"$flag")
+    FP_LOCS[$fp]+="$kat"$'\t'"$f"$'\t'"$flag"$'\n'
+  done
+}
+
+# Kategoria pliku: ADMIN (można zmieniać), RPM (tylko blokować), BLOCK_OK / BLOCK_BAD (blokady)
+file_category() { # plik
+  local f=$1 real
+  real=$(readlink -f "$f")
+  case $f in
+    */"$BLOCK"/*)       echo BLOCK_OK; return ;;
+    */"$OTHER_BLOCK"/*) echo BLOCK_BAD; return ;;
+  esac
+  case $real in
+    /usr/*) echo RPM ;;     # także symlinki z /etc wskazujące na pliki pakietów
+    *)      echo ADMIN ;;
+  esac
+}
+
+if $SELECTING; then
+  log "Przeszukiwanie $SRC_USR i $SRC_ETC..."
+  while IFS= read -r f; do
+    scan_file "$f" "$(file_category "$f")"
+  done < <(find -L "$SRC_USR" "$SRC_ETC" -type f -size -20M 2>/dev/null | sort)
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Wybór certyfikatów i plan zmian
+# ---------------------------------------------------------------------------
+declare -A SELECTED=() EXPLICIT=() NEWEST=() SEL_CHUNK=() SEL_COUNT=()
+SHOWN=()
+
+if $SELECTING; then
+  # Najnowsza wersja każdego subject (dla -O)
+  for fp in "${FP_LIST[@]}"; do
+    s=${FP_SUBJ[$fp]}
+    if [ -z "${NEWEST[$s]:-}" ] || [ "${FP_ENDTS[$fp]}" -gt "${FP_ENDTS[${NEWEST[$s]}]}" ]; then NEWEST[$s]=$fp; fi
+  done
+
+  for fp in "${FP_LIST[@]}"; do
+    subj=${FP_SUBJ[$fp]}
+    if [ -n "$NAME" ] && [[ "${subj,,}"$'\n'"${FP_ISS[$fp],,}" != *"${NAME,,}"* ]]; then continue; fi
+    why=""
+    for s in "${SERIALS[@]}"; do [ "$s" = "${FP_SER[$fp]}" ] && why+="serial, " && EXPLICIT[$fp]=1; done
+    for x in "${FPS[@]}";     do [ "$x" = "$(norm_fp "$fp")" ] && why+="SHA256, " && EXPLICIT[$fp]=1; done
+    if $SEL_EXPIRED && [ "${FP_ENDTS[$fp]}" -le "$NOW" ]; then why+="wygasły, "; fi
+    if $SEL_OLD && [ "${NEWEST[$subj]}" != "$fp" ]; then why+="starsza wersja, "; fi
+    # Z nazwą pokazujemy też to, co zostaje - żeby było widać pełny obraz danego CA
+    if [ -n "$why" ]; then SELECTED[$fp]=${why%, }; SHOWN+=("$fp")
+    elif [ -n "$NAME" ]; then SHOWN+=("$fp"); fi
+  done
+
+  for e in "${ENTRIES[@]}"; do
+    IFS=$'\t' read -r kat f c fp flag <<< "$e"
+    [ -n "${SELECTED[$fp]:-}" ] || continue
+    if [ "$kat" = ADMIN ] && [ "$flag" != distrusted ]; then
+      SEL_CHUNK[$c]=1
+      SEL_COUNT[$f]=$(( ${SEL_COUNT[$f]:-0} + 1 ))
+    fi
+  done
+  for f in "${!SEL_COUNT[@]}"; do
+    [ -n "${TOUCHED[$f]:-}" ] && continue   # i tak usuwany/przenoszony przez -S
+    if [ -n "${FILE_DER[$f]:-}" ] || [ "${SEL_COUNT[$f]}" -ge "${FILE_NCERT[$f]}" ]; then
+      add_op REMOVE "$f" "zawiera tylko wybrane certyfikaty"
+    else
+      add_op REWRITE "$f" "${SEL_COUNT[$f]} z ${FILE_NCERT[$f]} certyfikatów"
+    fi
+  done
+
+  for fp in "${!SELECTED[@]}"; do
+    locs=${FP_LOCS[$fp]}
+    grep -q $'^RPM\t' <<< "$locs" || continue
+    grep -qE $'^BLOCK_OK\t|\tdistrusted$' <<< "$locs" && continue   # już zablokowany
+    if [ -n "${EXPLICIT[$fp]:-}" ] || $BLOCK_RPM; then
+      add_op BLOCK "$fp"
+    fi
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Prezentacja planu
+# ---------------------------------------------------------------------------
+role() { # kategoria plik flaga
+  local r
+  case $1 in
+    ADMIN)     r="plik admina" ;;
+    RPM)       r="z pakietu $(rpm -qf "$2" 2>/dev/null || echo RPM)" ;;
+    BLOCK_OK)  r="blokada" ;;
+    BLOCK_BAD) r="blokada w złym katalogu ($OTHER_BLOCK) - nie działa" ;;
+  esac
+  [ "$3" = distrusted ] && r="$r, x-distrusted"
+  echo "$r"
+}
+
+if $SELECTING; then
+  hdr "Certyfikaty${NAME:+ pasujące do \"$NAME\"}"
+  if [ ${#SHOWN[@]} -eq 0 ]; then
+    log "Nic nie pasuje do podanych kryteriów"
+  fi
+  mapfile -t SORTED < <(for fp in "${SHOWN[@]}"; do
+      printf '%s\t%s\t%s\n' "${FP_SUBJ[$fp]}" "${FP_ENDTS[$fp]}" "$fp"
+    done | sort -t$'\t' -k1,1 -k2,2n | cut -f3)
+  n=0; prev=""
+  for fp in "${SORTED[@]}"; do
+    n=$((n + 1))
+    if [ "${FP_SUBJ[$fp]}" != "$prev" ]; then echo; echo "  ${BLD}■ ${FP_SUBJ[$fp]}${RST}"; prev=${FP_SUBJ[$fp]}; fi
+    days=$(( (FP_ENDTS[$fp] - NOW) / 86400 ))
+    if [ "${FP_ENDTS[$fp]}" -le "$NOW" ]; then st="${RED}wygasł $(( -days )) dni temu${RST}"
+    else st="${GRN}ważny jeszcze $days dni${RST}"; fi
+    if [ -n "${SELECTED[$fp]:-}" ]; then mark="${RED}USUWANY${RST} (${SELECTED[$fp]})"; else mark="${GRN}zostaje${RST}"; fi
+    echo "    [$n] $mark  $st, ważny do $(date -d "${FP_END[$fp]}" +%F 2>/dev/null)"
+    echo "        serial: ${FP_SER_RAW[$fp]}   SHA256: $fp"
+    while IFS=$'\t' read -r kat f flag; do
+      [ -n "$kat" ] && printf "        %-60s %s\n" "$f" "$(role "$kat" "$f" "$flag")"
+    done <<< "${FP_LOCS[$fp]}"
+    if [ -n "${SELECTED[$fp]:-}" ] && grep -q $'^RPM\t' <<< "${FP_LOCS[$fp]}" \
+       && ! grep -qE $'^BLOCK_OK\t|\tdistrusted$' <<< "${FP_LOCS[$fp]}" \
+       && [ -z "${EXPLICIT[$fp]:-}" ] && ! $BLOCK_RPM; then
+      echo "        ${YEL}→ pochodzi z RPM - pomijam (dodaj -R, żeby go zablokować)${RST}"
+    fi
+    if [ -n "${SELECTED[$fp]:-}" ] && [ "${FP_ENDTS[$fp]}" -gt "$NOW" ]; then
+      echo "        ${YEL}→ UWAGA: ten certyfikat jest jeszcze WAŻNY${RST}"
+    fi
+  done
+
+  # Czy po zmianach zostanie jakaś ważna wersja danego CA
+  declare -A LEFT=()
+  for fp in "${FP_LIST[@]}"; do
+    [ -z "${SELECTED[$fp]:-}" ] && [ "${FP_ENDTS[$fp]}" -gt "$NOW" ] && LEFT[${FP_SUBJ[$fp]}]=1
+  done
+  declare -A WARNED=()
+  for fp in "${!SELECTED[@]}"; do
+    s=${FP_SUBJ[$fp]}
+    if [ -z "${LEFT[$s]:-}" ] && [ -z "${WARNED[$s]:-}" ]; then
+      warn "Po zmianach nie zostanie ŻADNA ważna wersja: $s"
+      WARNED[$s]=1
+    fi
+  done
+fi
+
+hdr "Plan zmian"
+if [ ${#OPS[@]} -eq 0 ]; then
+  log "Nic do zmiany."
+  exit 0
+fi
+for op in "${OPS[@]}"; do
+  IFS=$'\t' read -r t a b <<< "$op"
+  case $t in
+    REMOVE)  echo "  usuń plik     $a   ($b)" ;;
+    REWRITE) echo "  wytnij z      $a   ($b)" ;;
+    BLOCK)   echo "  zablokuj      ${FP_SUBJ[$a]} (SHA256 ${a:0:23}...) -> $SRC_ETC/$BLOCK/" ;;
+    LINK)    echo "  symlink       $a -> $b" ;;
+    MOVE)    echo "  przenieś      $a -> $b/" ;;
+  esac
+done
+echo "  update-ca-trust extract"
+echo
+echo "  Kopia zapasowa: $BK"
+
+if $DRY_RUN; then
+  log "DRY RUN - nic nie zostało zmienione."
+  exit 0
+fi
+if ! $ASSUME_YES; then
+  echo
+  read -r -p "Wykonać? [t/N] " ans
+  [[ "$ans" =~ ^[tTyY]$ ]] || die "Przerwano przez użytkownika"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Wykonanie
+# ---------------------------------------------------------------------------
+mkdir -p "$BK" || die "Nie mogę utworzyć $BK"
+tar czf "$BK/ca-trust-source-and-certs.tgz" -C / etc/pki/ca-trust/source etc/pki/tls/certs 2>/dev/null \
+  || die "Nie udała się kopia zapasowa - przerywam"
+log "Kopia: $BK/ca-trust-source-and-certs.tgz"
+ROLLBACK="rm -rf $SRC_ETC /etc/pki/tls/certs && tar xzf $BK/ca-trust-source-and-certs.tgz -C / && update-ca-trust extract"
+
+stash() { # plik - przenosi do katalogu kopii z zachowaniem ścieżki
+  mkdir -p "$BK/files$(dirname "$1")" && mv "$1" "$BK/files$1"
+}
+
+FAILED=0
+for op in "${OPS[@]}"; do
+  IFS=$'\t' read -r t a b <<< "$op"
+  case $t in
+    REMOVE)
+      if stash "$a"; then log "usunięty (w kopii): $a"; else warn "nie udało się usunąć $a"; FAILED=$((FAILED + 1)); fi ;;
+    REWRITE)
+      mkdir -p "$BK/files$(dirname "$a")" && cp -p "$a" "$BK/files$a" || { warn "brak kopii $a - pomijam"; FAILED=$((FAILED + 1)); continue; }
+      : > "$WORK/rewrite"
+      for c in "${FILE_DIR[$a]}"/*; do
+        [ -n "${SEL_CHUNK[$c]:-}" ] || cat "$c" >> "$WORK/rewrite"
+      done
+      # cat > zachowuje właściciela, uprawnienia i kontekst SELinux pliku
+      if cat "$WORK/rewrite" > "$a"; then log "wycięto certyfikaty z: $a"; else warn "zapis $a nieudany"; FAILED=$((FAILED + 1)); fi ;;
+    BLOCK)
+      cn=${FP_SUBJ[$a]#*CN=}; cn=${cn%%,*}
+      dst="$SRC_ETC/$BLOCK/$(tr -c 'A-Za-z0-9._-' '_' <<< "$cn" | sed 's/_*$//')_$(norm_fp "$a" | cut -c1-8).pem"
+      mkdir -p "$SRC_ETC/$BLOCK" && cp "${FP_PEM[$a]}" "$dst" && chmod 644 "$dst" \
+        && log "zablokowany: $dst" || { warn "blokada nieudana: $dst"; FAILED=$((FAILED + 1)); } ;;
+    LINK)
+      if [ -e "$a" ] && [ ! -L "$a" ]; then stash "$a" || { warn "nie mogę przenieść $a"; FAILED=$((FAILED + 1)); continue; }; fi
+      ln -sfn "$b" "$a" && log "symlink: $a -> $b" || { warn "symlink $a nieudany"; FAILED=$((FAILED + 1)); } ;;
+    MOVE)
+      mkdir -p "$b" && mv "$a" "$b/" && log "przeniesiony: $a -> $b/" || { warn "nie mogę przenieść $a"; FAILED=$((FAILED + 1)); } ;;
+  esac
+done
+
+command -v restorecon >/dev/null && restorecon -R "$SRC_ETC" /etc/pki/tls/certs 2>/dev/null
+
+log "update-ca-trust extract..."
+if ! update-ca-trust extract; then
+  die "update-ca-trust extract zakończył się błędem. Przywrócenie: $ROLLBACK"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Weryfikacja
+# ---------------------------------------------------------------------------
+hdr "Weryfikacja"
+declare -A IN_TLS=()
+mkdir -p "$WORK/tls"
+awk -v d="$WORK/tls" '/-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/%04d.pem", d, n) }
+                      f { print > f } /-----END CERTIFICATE-----/ { close(f); f = "" }' "$TLS_BUNDLE"
+for c in "$WORK"/tls/*.pem; do
+  [ -e "$c" ] || continue
+  IN_TLS["$(openssl x509 -in "$c" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)"]=1
+done
+
+for fp in "${!SELECTED[@]}"; do
+  if [ -n "${IN_TLS[$fp]:-}" ]; then
+    if grep -q $'^RPM\t' <<< "${FP_LOCS[$fp]}" && [ -z "${EXPLICIT[$fp]:-}" ] && ! $BLOCK_RPM; then
+      log "  ${YEL}nadal w bundlu (z RPM, pominięty bez -R):${RST} ${FP_SUBJ[$fp]}  serial ${FP_SER_RAW[$fp]}"
+    else
+      warn "nadal w bundlu: ${FP_SUBJ[$fp]}  serial ${FP_SER_RAW[$fp]} - sprawdź: ./ca_trust_info.yml"
+      FAILED=$((FAILED + 1))
+    fi
+  else
+    log "  ${GRN}usunięty z bundla:${RST} ${FP_SUBJ[$fp]}  serial ${FP_SER_RAW[$fp]}"
+  fi
+done
+for l in /etc/pki/tls/certs/ca-bundle.crt /etc/pki/tls/certs/ca-bundle.trust.crt; do
+  [ -L "$l" ] || warn "$l nie jest symlinkiem (napraw opcją -S)"
+done
+if command -v trust >/dev/null; then
+  w=$(trust list 2>&1 >/dev/null | sort -u | head -5)
+  if [ -n "$w" ]; then warn "p11-kit nadal zgłasza:"; sed 's/^/          /' <<< "$w" >&2; fi
+fi
+
+echo
+log "Certyfikatów w bundlu TLS: ${#IN_TLS[@]}"
+log "Wycofanie zmian: $ROLLBACK"
+if [ "$FAILED" -gt 0 ]; then
+  die "Zakończono z problemami: $FAILED"
+fi
+log "Gotowe."
