@@ -22,10 +22,10 @@ mkdir -p "${BASE_DIR}/bin/lib" \
 
 cp -f "${SRC_DIR}/bin/log-transfer.sh" "${BASE_DIR}/bin/"
 cp -f "${SRC_DIR}/bin/migrate-logs.py" "${BASE_DIR}/bin/"
-cp -f "${SRC_DIR}/bin/lib/"* "${BASE_DIR}/bin/lib/"
+cp -f "${SRC_DIR}/bin/lib/"*.sh "${SRC_DIR}/bin/lib/"*.py "${BASE_DIR}/bin/lib/"
 cp -f "${SRC_DIR}/etc/template.conf" "${BASE_DIR}/etc/"
 
-chmod 755 "${BASE_DIR}/bin/log-transfer.sh" "${BASE_DIR}/bin/migrate-logs.py"
+chmod 755 "${BASE_DIR}/bin/log-transfer.sh" "${BASE_DIR}/bin/migrate-logs.py" "${BASE_DIR}/bin/lib/"*.sh
 chmod 750 "${BASE_DIR}/etc/creds"
 chmod 1777 "${BASE_DIR}/var/spool"
 chmod 755 "${BASE_DIR}/var/state" "${BASE_DIR}/var/state/jobs"
