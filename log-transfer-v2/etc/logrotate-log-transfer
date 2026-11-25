@@ -1,0 +1,9 @@
+/opt/log-transfer/var/logs/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

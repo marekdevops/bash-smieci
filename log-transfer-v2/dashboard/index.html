@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Log Transfer Monitor — Panel Administratora</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot" id="globalDot"></span>
+      <div>
+        <h1>Log Transfer Monitor</h1>
+        <p class="subtitle">Audyt i status transferów do partnerów zewnętrznych</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span class="meta-text" id="lastRefresh">Ładowanie...</span>
+      <label class="toggle">
+        <input type="checkbox" id="autoRefresh" checked>
+        <span>Auto (30s)</span>
+      </label>
+      <button class="btn" id="refreshBtn" type="button">Odśwież</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="kpi-grid" aria-label="Podsumowanie">
+      <article class="kpi-card">
+        <span class="kpi-label">Zadania ogółem</span>
+        <strong class="kpi-value" id="kpiTotal">—</strong>
+      </article>
+      <article class="kpi-card kpi-ok">
+        <span class="kpi-label">Status OK</span>
+        <strong class="kpi-value" id="kpiOk">—</strong>
+      </article>
+      <article class="kpi-card kpi-err">
+        <span class="kpi-label">Błędy / Alert</span>
+        <strong class="kpi-value" id="kpiErr">—</strong>
+      </article>
+      <article class="kpi-card">
+        <span class="kpi-label">Przesłane pliki / Wolumen</span>
+        <strong class="kpi-value" id="kpiFiles">—</strong>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Zadania transferu</h2>
+        <div class="filters">
+          <input type="search" id="searchInput" placeholder="Szukaj (job, user, host)...">
+          <select id="statusFilter">
+            <option value="ALL">Wszystkie statusy</option>
+            <option value="OK">Tylko OK</option>
+            <option value="ERROR">Tylko ERROR</option>
+            <option value="STALE">Przeterminowane (&gt;26h)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Zadanie</th>
+              <th>Użytkownik</th>
+              <th>Protokół / Cel</th>
+              <th>Ostatni transfer</th>
+              <th>Czas</th>
+              <th>Pliki</th>
+              <th>Wolumen</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="jobsTableBody">
+            <tr><td colspan="8" class="empty">Ładowanie danych z /api/summary.json...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="detailModal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-header">
+        <div>
+          <h3 id="modalTitle">Szczegóły zadania</h3>
+          <p class="subtitle" id="modalSubtitle"></p>
+        </div>
+        <button class="btn btn-ghost" id="closeModalBtn" type="button">Zamknij</button>
+      </div>
+      <div class="modal-body">
+        <div class="error-banner" id="modalError" hidden></div>
+        <div class="detail-meta" id="modalMeta"></div>
+        <h4>Lista przesłanych plików z ostatniego uruchomienia</h4>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Plik</th>
+                <th>Rozmiar</th>
+                <th>SHA-256</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="modalFilesBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

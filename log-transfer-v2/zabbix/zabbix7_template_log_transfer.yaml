@@ -1,0 +1,138 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: 7df96b18c230490a9a0a9e2307226338
+      name: Templates/Applications
+  templates:
+    - uuid: a4e1d2c3b4f5467890abcdef12345678
+      template: 'Log Transfer Monitor v2'
+      name: 'Log Transfer Monitor v2'
+      description: 'Monitoring transferów logów do partnerów zewnętrznych (summary.json)'
+      groups:
+        - name: Templates/Applications
+      items:
+        - uuid: 11111111222243338444555555555501
+          name: 'Log Transfer: Summary JSON (Master)'
+          type: ZABBIX_PASSIVE
+          key: 'vfs.file.contents[/opt/log-transfer/var/state/summary.json]'
+          delay: 1m
+          history: '0'
+          trends: '0'
+          value_type: TEXT
+          description: 'Główny item odczytujący atomowy plik summary.json'
+        - uuid: 11111111222243338444555555555502
+          name: 'Log Transfer: Jobs Error Total'
+          type: DEPENDENT
+          key: logtransfer.totals.jobs_error
+          delay: '0'
+          value_type: UNSIGNED
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.totals.jobs_error
+          master_item:
+            key: 'vfs.file.contents[/opt/log-transfer/var/state/summary.json]'
+          triggers:
+            - uuid: 22222222333344448555666666666601
+              expression: 'last(/Log Transfer Monitor v2/logtransfer.totals.jobs_error)>0'
+              name: 'Co najmniej jedno zadanie transferu logów zgłosiło błąd'
+              priority: HIGH
+      discovery_rules:
+        - uuid: 33333333444445558666777777777701
+          name: 'Log Transfer Jobs Discovery'
+          type: DEPENDENT
+          key: logtransfer.jobs.lld
+          delay: '0'
+          lifetime: 7d
+          master_item:
+            key: 'vfs.file.contents[/opt/log-transfer/var/state/summary.json]'
+          lld_macro_paths:
+            - lld_macro: '{#JOB_ID}'
+              path: $.job_id
+            - lld_macro: '{#OWNER}'
+              path: $.owner
+            - lld_macro: '{#REMOTE_HOST}'
+              path: $.remote_host
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - '$.jobs[*]'
+          item_prototypes:
+            - uuid: 44444444555546668777888888888801
+              name: 'Job [{#JOB_ID}] ({#OWNER}): Status'
+              type: DEPENDENT
+              key: 'logtransfer.job.status[{#JOB_ID}]'
+              delay: '0'
+              trends: '0'
+              value_type: CHAR
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.jobs[?(@.job_id == "{#JOB_ID}")].status.first()'
+              master_item:
+                key: 'vfs.file.contents[/opt/log-transfer/var/state/summary.json]'
+              trigger_prototypes:
+                - uuid: 55555555666647778888999999999901
+                  expression: 'last(/Log Transfer Monitor v2/logtransfer.job.status[{#JOB_ID}])<>"OK"'
+                  name: 'Błąd transferu logów: {#JOB_ID} (user: {#OWNER} -> {#REMOTE_HOST})'
+                  priority: HIGH
+            - uuid: 44444444555546668777888888888802
+              name: 'Job [{#JOB_ID}]: Files Transferred'
+              type: DEPENDENT
+              key: 'logtransfer.job.files_transferred[{#JOB_ID}]'
+              delay: '0'
+              value_type: UNSIGNED
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.jobs[?(@.job_id == "{#JOB_ID}")].files_transferred.first()'
+              master_item:
+                key: 'vfs.file.contents[/opt/log-transfer/var/state/summary.json]'
+            - uuid: 44444444555546668777888888888803
+              name: 'Job [{#JOB_ID}]: Files Failed'
+              type: DEPENDENT
+              key: 'logtransfer.job.files_failed[{#JOB_ID}]'
+              delay: '0'
+              value_type: UNSIGNED
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.jobs[?(@.job_id == "{#JOB_ID}")].files_failed.first()'
+              master_item:
+                key: 'vfs.file.contents[/opt/log-transfer/var/state/summary.json]'
+              trigger_prototypes:
+                - uuid: 55555555666647778888999999999902
+                  expression: 'last(/Log Transfer Monitor v2/logtransfer.job.files_failed[{#JOB_ID}])>0'
+                  name: 'Nieudana wysyłka części plików w {#JOB_ID}'
+                  priority: AVERAGE
+            - uuid: 44444444555546668777888888888804
+              name: 'Job [{#JOB_ID}]: Last Finished (Epoch)'
+              type: DEPENDENT
+              key: 'logtransfer.job.finished_epoch[{#JOB_ID}]'
+              delay: '0'
+              units: unixtime
+              value_type: UNSIGNED
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.jobs[?(@.job_id == "{#JOB_ID}")].finished_at_epoch.first()'
+              master_item:
+                key: 'vfs.file.contents[/opt/log-transfer/var/state/summary.json]'
+              trigger_prototypes:
+                - uuid: 55555555666647778888999999999903
+                  expression: '(now()-last(/Log Transfer Monitor v2/logtransfer.job.finished_epoch[{#JOB_ID}]))>93600'
+                  name: 'Brak wykonania transferu {#JOB_ID} od ponad 26h'
+                  priority: AVERAGE
+            - uuid: 44444444555546668777888888888805
+              name: 'Job [{#JOB_ID}]: Duration'
+              type: DEPENDENT
+              key: 'logtransfer.job.duration[{#JOB_ID}]'
+              delay: '0'
+              units: s
+              value_type: UNSIGNED
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.jobs[?(@.job_id == "{#JOB_ID}")].duration_sec.first()'
+              master_item:
+                key: 'vfs.file.contents[/opt/log-transfer/var/state/summary.json]'
