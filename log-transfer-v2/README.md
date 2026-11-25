@@ -20,10 +20,12 @@ Kompleksowy system bezpiecznego transferu logów do partnerów zewnętrznych (FT
    ```bash
    chmod +x install.sh && ./install.sh
    ```
-3. Przeskanuj obecne crontaby i wykonaj próbę migracji:
+3. Przeskanuj obecne crontaby i wybierz zadania interaktywnie (lub wykonaj próbę dla wszystkich):
    ```bash
+   python /opt/log-transfer/bin/migrate-logs.py --interactive
+   # lub bez interakcji:
    python /opt/log-transfer/bin/migrate-logs.py --scan
-   python /opt/log-transfer/bin/migrate-logs.py --dry-run
+   python /opt/log-transfer/bin/migrate-logs.py --dry-run --job-id marek_logs_copy2
    ```
 4. Po weryfikacji wdróż migrację:
    ```bash

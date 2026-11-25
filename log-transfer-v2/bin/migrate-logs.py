@@ -222,6 +222,52 @@ def cmd_rollback(base_dir, timestamp, cron_dir):
     return 0
 
 
+def prompt_input(msg):
+    if sys.version_info[0] < 3:
+        return raw_input(msg)  # noqa: F821
+    return input(msg)
+
+
+def select_plan_interactive(plan):
+    """Pozwala użytkownikowi wybrać numery zadań z listy skanowania."""
+    while True:
+        raw = prompt_input(
+            "\nWybierz numery zadań do migracji (np. 1,3 lub 1-3, 'all', 'q' aby anulować): "
+        ).strip().lower()
+        if raw in ("q", "quit", "exit", ""):
+            return []
+        if raw == "all":
+            return list(plan)
+
+        selected_indices = set()
+        valid = True
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                bounds = part.split("-", 1)
+                if len(bounds) == 2 and bounds[0].isdigit() and bounds[1].isdigit():
+                    start, end = int(bounds[0]), int(bounds[1])
+                    if 1 <= start <= end <= len(plan):
+                        for idx in range(start, end + 1):
+                            selected_indices.add(idx - 1)
+                        continue
+                valid = False
+                break
+            elif part.isdigit():
+                idx = int(part)
+                if 1 <= idx <= len(plan):
+                    selected_indices.add(idx - 1)
+                    continue
+            valid = False
+            break
+
+        if valid and selected_indices:
+            return [plan[i] for i in sorted(selected_indices)]
+        print("Nieprawidłowy wybór. Podaj numery od 1 do %d." % len(plan))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Migrator log-transfer-v2 dla RHEL 7")
     parser.add_argument("--cron-dir", default="/var/spool/cron", help="Katalog crontabów użytkowników")
@@ -230,18 +276,21 @@ def main():
     parser.add_argument("--scan", action="store_true", help="Tylko skanuj i wypisz raport")
     parser.add_argument("--dry-run", action="store_true", help="Symuluj migrację bez zapisu zmian")
     parser.add_argument("--apply", action="store_true", help="Wykonaj migrację i podmień crontaby")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Tryb interaktywny: skanuj i wybierz zadania z listy")
+    parser.add_argument("--job-id", default="", help="Filtruj po JOB_ID (rozdzielone przecinkiem)")
+    parser.add_argument("--user", default="", help="Filtruj po użytkowniku crona")
     parser.add_argument("--rollback", default="", help="Przywróć crontaby z podanego timestampu backupu")
     args = parser.parse_args()
 
     if args.rollback:
         return cmd_rollback(args.base_dir, args.rollback, args.cron_dir)
 
-    if not (args.scan or args.dry_run or args.apply):
+    if not (args.scan or args.dry_run or args.apply or args.interactive):
         parser.print_help()
         return 2
 
     template_path = args.template or os.path.join(args.base_dir, "etc", "template.conf")
-    if (args.dry_run or args.apply) and not os.path.isfile(template_path):
+    if (args.dry_run or args.apply or args.interactive) and not os.path.isfile(template_path):
         print("BŁĄD: Nie znaleziono szablonu: %s" % template_path, file=sys.stderr)
         return 1
 
@@ -266,19 +315,44 @@ def main():
             "job_id": job_id,
         })
 
+    if args.user:
+        plan = [e for e in plan if e["finding"]["user"] == args.user]
+    if args.job_id:
+        wanted = set(x.strip() for x in args.job_id.split(",") if x.strip())
+        plan = [e for e in plan if e["job_id"] in wanted]
+
+    if not plan:
+        print("Brak zadań spełniających podane kryteria filtrowania.")
+        return 0
+
     print("=== WYNIK SKANOWANIA (%d zadań) ===" % len(plan))
-    for entry in plan:
+    for idx, entry in enumerate(plan, 1):
         f = entry["finding"]
         p = entry["parsed"]
-        print("- [%s] user=%s | schedule='%s' | script=%s" % (
-            entry["job_id"], f["user"], f["schedule"], f["script_path"]
+        print("[%d] %s | user=%s | schedule='%s' | script=%s" % (
+            idx, entry["job_id"], f["user"], f["schedule"], f["script_path"]
         ))
         if p["warnings"]:
             for w in p["warnings"]:
                 print("    OSTRZEŻENIE: %s" % w)
 
-    if args.scan:
+    if args.scan and not args.interactive:
         return 0
+
+    if args.interactive:
+        plan = select_plan_interactive(plan)
+        if not plan:
+            print("Anulowano migrację.")
+            return 0
+        if not (args.dry_run or args.apply):
+            mode = prompt_input("Tryb wykonania: [d] dry-run (symulacja), [a] apply (migracja), [q] anuluj: ").strip().lower()
+            if mode == "d":
+                args.dry_run = True
+            elif mode == "a":
+                args.apply = True
+            else:
+                print("Anulowano migrację.")
+                return 0
 
     ts = time.strftime("%Y%m%d_%H%M%S")
     backup_dir = os.path.join(args.base_dir, "backups", ts)
