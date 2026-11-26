@@ -8,7 +8,6 @@ Kompatybilny z Python 2.7 (RHEL 7) oraz Python 3.x.
 """
 from __future__ import print_function, unicode_literals
 import argparse
-import codecs
 import glob
 import io
 import json
@@ -25,6 +24,16 @@ def to_unicode(val):
     if sys.version_info[0] < 3 and isinstance(val, str):
         return val.decode("utf-8", "replace")
     return val
+
+
+def uprint(msg="", file=None):
+    target = file if file is not None else sys.stdout
+    if sys.version_info[0] < 3:
+        if not isinstance(msg, str):
+            msg = msg.encode("utf-8")
+        target.write(msg + b"\n")
+    else:
+        print(msg, file=target)
 
 
 DEFAULT_PATTERNS = [
@@ -240,12 +249,12 @@ def safe_chown(path, user):
 def cmd_rollback(base_dir, timestamp, cron_dir):
     backup_dir = os.path.join(base_dir, "backups", timestamp)
     if not os.path.isdir(backup_dir):
-        print("BŁĄD: Brak katalogu kopii zapasowej: %s" % backup_dir, file=sys.stderr)
+        uprint("BŁĄD: Brak katalogu kopii zapasowej: %s" % backup_dir, file=sys.stderr)
         return 1
 
     cron_backups = glob.glob(os.path.join(backup_dir, "cron_*.bak"))
     if not cron_backups:
-        print("Brak kopii crontabów w %s" % backup_dir)
+        uprint("Brak kopii crontabów w %s" % backup_dir)
         return 1
 
     for bak in cron_backups:
@@ -255,13 +264,17 @@ def cmd_rollback(base_dir, timestamp, cron_dir):
             subprocess.check_call(["crontab", "-u", user, bak])
         else:
             shutil.copy2(bak, target_cron)
-        print("Przywrócono crontab użytkownika: %s" % user)
+        uprint("Przywrócono crontab użytkownika: %s" % user)
     return 0
 
 
 def prompt_input(msg):
     if sys.version_info[0] < 3:
-        return raw_input(msg)  # noqa: F821
+        if not isinstance(msg, str):
+            msg = msg.encode("utf-8")
+        sys.stdout.write(msg)
+        sys.stdout.flush()
+        return to_unicode(sys.stdin.readline().rstrip(b"\r\n"))
     return input(msg)
 
 
@@ -302,14 +315,10 @@ def select_plan_interactive(plan):
 
         if valid and selected_indices:
             return [plan[i] for i in sorted(selected_indices)]
-        print("Nieprawidłowy wybór. Podaj numery od 1 do %d." % len(plan))
+        uprint("Nieprawidłowy wybór. Podaj numery od 1 do %d." % len(plan))
 
 
 def main():
-    if sys.version_info[0] < 3:
-        sys.stdout = codecs.getwriter("utf-8")(sys.stdout)
-        sys.stderr = codecs.getwriter("utf-8")(sys.stderr)
-
     parser = argparse.ArgumentParser(description="Migrator log-transfer-v2 dla RHEL 7")
     parser.add_argument("--cron-dir", default="/var/spool/cron", help="Katalog crontabów użytkowników")
     parser.add_argument("--base-dir", default="/opt/log-transfer", help="Docelowy katalog log-transfer-v2")
@@ -340,13 +349,13 @@ def main():
 
     template_path = args.template or os.path.join(args.base_dir, "etc", "template.conf")
     if (args.dry_run or args.apply or args.interactive) and not os.path.isfile(template_path):
-        print("BŁĄD: Nie znaleziono szablonu: %s" % template_path, file=sys.stderr)
+        uprint("BŁĄD: Nie znaleziono szablonu: %s" % template_path, file=sys.stderr)
         return 1
 
     patterns = [r"\.sh(?:\s|$|;|&|\|)"] if args.all_sh else (DEFAULT_PATTERNS + args.pattern)
     findings = scan_crontabs(args.cron_dir, patterns)
     if not findings:
-        print("Nie znaleziono starych skryptów w %s" % args.cron_dir)
+        uprint("Nie znaleziono starych skryptów w %s" % args.cron_dir)
         return 0
 
     template_text = ""
@@ -372,19 +381,19 @@ def main():
         plan = [e for e in plan if e["job_id"] in wanted]
 
     if not plan:
-        print("Brak zadań spełniających podane kryteria filtrowania.")
+        uprint("Brak zadań spełniających podane kryteria filtrowania.")
         return 0
 
-    print("=== WYNIK SKANOWANIA (%d zadań) ===" % len(plan))
+    uprint("=== WYNIK SKANOWANIA (%d zadań) ===" % len(plan))
     for idx, entry in enumerate(plan, 1):
         f = entry["finding"]
         p = entry["parsed"]
-        print("[%d] %s | user=%s | schedule='%s' | script=%s" % (
+        uprint("[%d] %s | user=%s | schedule='%s' | script=%s" % (
             idx, entry["job_id"], f["user"], f["schedule"], f["script_path"]
         ))
         if p["warnings"]:
             for w in p["warnings"]:
-                print("    OSTRZEŻENIE: %s" % w)
+                uprint("    OSTRZEŻENIE: %s" % w)
 
     if args.scan and not args.interactive:
         return 0
@@ -392,7 +401,7 @@ def main():
     if args.interactive:
         plan = select_plan_interactive(plan)
         if not plan:
-            print("Anulowano migrację.")
+            uprint("Anulowano migrację.")
             return 0
         if not (args.dry_run or args.apply):
             mode = prompt_input("Tryb wykonania: [d] dry-run (symulacja), [a] apply (migracja), [q] anuluj: ").strip().lower()
@@ -401,7 +410,7 @@ def main():
             elif mode == "a":
                 args.apply = True
             else:
-                print("Anulowano migrację.")
+                uprint("Anulowano migrację.")
                 return 0
 
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -430,9 +439,9 @@ def main():
         ftp_pass = p["vars"].get("FTP_PASS", "")
 
         if args.dry_run:
-            print("\n[DRY-RUN] Plik: %s" % conf_path)
-            print("[DRY-RUN] Hasło: %s (chmod 0600, owner=%s)" % (cred_path, f["user"]))
-            print("[DRY-RUN] Nowy wpis cron (%s): %s" % (f["user"], new_cron_line.strip()))
+            uprint("\n[DRY-RUN] Plik: %s" % conf_path)
+            uprint("[DRY-RUN] Hasło: %s (chmod 0600, owner=%s)" % (cred_path, f["user"]))
+            uprint("[DRY-RUN] Nowy wpis cron (%s): %s" % (f["user"], new_cron_line.strip()))
             continue
 
         # Zapis konfiguracji
@@ -481,8 +490,8 @@ def main():
                     if sys.version_info[0] < 3 and isinstance(new_cron_text, str):
                         new_cron_text = new_cron_text.decode("utf-8")
                     fh.write(new_cron_text)
-        print("\nMigracja zakończona. Backup zapisany w: %s" % backup_dir)
-        print("W razie potrzeby cofnij zmiany: --rollback %s" % ts)
+        uprint("\nMigracja zakończona. Backup zapisany w: %s" % backup_dir)
+        uprint("W razie potrzeby cofnij zmiany: --rollback %s" % ts)
 
     return 0
 
