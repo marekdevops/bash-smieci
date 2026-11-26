@@ -4,13 +4,19 @@
 Atomowy generator raportów JSON (<job_id>.json oraz summary.json).
 Kompatybilny z Python 2.7 (RHEL 7) oraz Python 3.x bez zewnętrznych bibliotek.
 """
-from __future__ import print_function
+from __future__ import print_function, unicode_literals
 import argparse
 import glob
 import io
 import json
 import os
 import sys
+
+
+def to_unicode(val):
+    if sys.version_info[0] < 3 and isinstance(val, str):
+        return val.decode("utf-8", "replace")
+    return val
 
 
 def atomic_write_json(target_path, payload):
@@ -136,23 +142,23 @@ def main():
     bytes_transferred = sum(f["size_bytes"] for f in files if f["status"] == "transferred")
 
     job_payload = {
-        "job_id": args.job_id,
-        "description": args.description,
-        "owner": args.owner,
-        "protocol": args.protocol,
-        "remote_host": args.remote_host,
-        "remote_dir": args.remote_dir,
-        "status": args.status,
+        "job_id": to_unicode(args.job_id),
+        "description": to_unicode(args.description),
+        "owner": to_unicode(args.owner),
+        "protocol": to_unicode(args.protocol),
+        "remote_host": to_unicode(args.remote_host),
+        "remote_dir": to_unicode(args.remote_dir),
+        "status": to_unicode(args.status),
         "exit_code": args.exit_code,
-        "started_at": args.started_at,
-        "finished_at": args.finished_at,
+        "started_at": to_unicode(args.started_at),
+        "finished_at": to_unicode(args.finished_at),
         "finished_at_epoch": args.finished_at_epoch,
         "duration_sec": args.duration_sec,
         "files_total": len(files),
         "files_transferred": files_transferred,
         "files_failed": files_failed,
         "bytes_transferred": bytes_transferred,
-        "error_message": args.error_message if args.error_message else None,
+        "error_message": to_unicode(args.error_message) if args.error_message else None,
         "files": files,
     }
 

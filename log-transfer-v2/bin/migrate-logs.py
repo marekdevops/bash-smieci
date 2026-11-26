@@ -6,8 +6,9 @@ oraz wpisów cron wielu użytkowników na nowy system log-transfer-v2.
 
 Kompatybilny z Python 2.7 (RHEL 7) oraz Python 3.x.
 """
-from __future__ import print_function
+from __future__ import print_function, unicode_literals
 import argparse
+import codecs
 import glob
 import io
 import json
@@ -18,6 +19,12 @@ import shutil
 import subprocess
 import sys
 import time
+
+
+def to_unicode(val):
+    if sys.version_info[0] < 3 and isinstance(val, str):
+        return val.decode("utf-8", "replace")
+    return val
 
 
 DEFAULT_PATTERNS = [
@@ -299,6 +306,10 @@ def select_plan_interactive(plan):
 
 
 def main():
+    if sys.version_info[0] < 3:
+        sys.stdout = codecs.getwriter("utf-8")(sys.stdout)
+        sys.stderr = codecs.getwriter("utf-8")(sys.stderr)
+
     parser = argparse.ArgumentParser(description="Migrator log-transfer-v2 dla RHEL 7")
     parser.add_argument("--cron-dir", default="/var/spool/cron", help="Katalog crontabów użytkowników")
     parser.add_argument("--base-dir", default="/opt/log-transfer", help="Docelowy katalog log-transfer-v2")
@@ -313,6 +324,12 @@ def main():
     parser.add_argument("--all-sh", action="store_true", help="Skanuj wszystkie skrypty *.sh w cronie")
     parser.add_argument("--rollback", default="", help="Przywróć crontaby z podanego timestampu backupu")
     args = parser.parse_args()
+    args.cron_dir = to_unicode(args.cron_dir)
+    args.base_dir = to_unicode(args.base_dir)
+    args.template = to_unicode(args.template)
+    args.job_id = to_unicode(args.job_id)
+    args.user = to_unicode(args.user)
+    args.rollback = to_unicode(args.rollback)
 
     if args.rollback:
         return cmd_rollback(args.base_dir, args.rollback, args.cron_dir)
