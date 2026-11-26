@@ -21,9 +21,7 @@ import time
 
 
 DEFAULT_PATTERNS = [
-    r"logs_copy\d*\.sh",
-    r"logs_mount\.sh",
-    r"logs\.sh",
+    r"(?:^|[/\s'\"])logs[A-Za-z0-9_.-]*\.sh(?:\s|$|;|&|\|)",
 ]
 
 VAR_REGEX = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*(?:#.*)?$')
@@ -88,6 +86,38 @@ def parse_old_script(script_path):
     return info
 
 
+def resolve_script_path(cmd, user):
+    """Rozwiązuje pełną ścieżkę skryptu z uwzględnieniem 'cd <katalog> && ./skrypt.sh'."""
+    m_cd = re.search(r'\bcd\s+(?:"([^"]+)"|\'([^\']+)\'|([^\s;&|]+))', cmd)
+    cd_dir = ""
+    if m_cd:
+        cd_dir = m_cd.group(1) or m_cd.group(2) or m_cd.group(3) or ""
+
+    m_path = re.search(r'(?:"([^"]+\.sh)"|\'([^\']+\.sh)\'|([^\s;&|]+\.sh))', cmd)
+    if not m_path:
+        return ""
+    raw_path = m_path.group(1) or m_path.group(2) or m_path.group(3) or ""
+
+    if raw_path.startswith("~"):
+        try:
+            home_dir = pwd.getpwnam(user).pw_dir
+            raw_path = home_dir + raw_path[1:]
+        except KeyError:
+            pass
+
+    if os.path.isabs(raw_path):
+        return os.path.normpath(raw_path)
+
+    if cd_dir:
+        return os.path.normpath(os.path.join(cd_dir, raw_path))
+
+    try:
+        home_dir = pwd.getpwnam(user).pw_dir
+        return os.path.normpath(os.path.join(home_dir, raw_path))
+    except KeyError:
+        return os.path.normpath(raw_path)
+
+
 def scan_crontabs(cron_dir, script_patterns):
     """Skanuje pliki crontab użytkowników w poszukiwaniu starych skryptów."""
     compiled = [re.compile(p) for p in script_patterns]
@@ -111,11 +141,11 @@ def scan_crontabs(cron_dir, script_patterns):
             if not m:
                 continue
             schedule, cmd = m.group(1), m.group(2)
+            if "log-transfer.sh" in cmd:
+                continue
             for pat in compiled:
                 if pat.search(cmd):
-                    # Wyciągnij pierwszą ścieżkę kończącą się na .sh
-                    m_path = re.search(r'(\S+\.sh)', cmd)
-                    script_path = m_path.group(1) if m_path else ""
+                    script_path = resolve_script_path(cmd, user)
                     findings.append({
                         "user": user,
                         "cron_file": cron_file,
@@ -279,6 +309,8 @@ def main():
     parser.add_argument("-i", "--interactive", action="store_true", help="Tryb interaktywny: skanuj i wybierz zadania z listy")
     parser.add_argument("--job-id", default="", help="Filtruj po JOB_ID (rozdzielone przecinkiem)")
     parser.add_argument("--user", default="", help="Filtruj po użytkowniku crona")
+    parser.add_argument("--pattern", action="append", default=[], help="Dodatkowy regex dla nazw skryptów (można powtarzać)")
+    parser.add_argument("--all-sh", action="store_true", help="Skanuj wszystkie skrypty *.sh w cronie")
     parser.add_argument("--rollback", default="", help="Przywróć crontaby z podanego timestampu backupu")
     args = parser.parse_args()
 
@@ -294,7 +326,8 @@ def main():
         print("BŁĄD: Nie znaleziono szablonu: %s" % template_path, file=sys.stderr)
         return 1
 
-    findings = scan_crontabs(args.cron_dir, DEFAULT_PATTERNS)
+    patterns = [r"\.sh(?:\s|$|;|&|\|)"] if args.all_sh else (DEFAULT_PATTERNS + args.pattern)
+    findings = scan_crontabs(args.cron_dir, patterns)
     if not findings:
         print("Nie znaleziono starych skryptów w %s" % args.cron_dir)
         return 0
