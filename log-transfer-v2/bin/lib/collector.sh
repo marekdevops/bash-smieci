@@ -176,11 +176,11 @@ pack_staging_archive() {
         return 1
     fi
 
-    log_info "Tworzenie archiwum: ${archive_path}"
+    log_info "Tworzenie archiwum: ${archive_path}" >&2
     GZIP="-${GZIP_LEVEL:-6}" tar -czf "${archive_path}" -C "${src_dir}" .
 
     if [ "${GPG_ENCRYPT}" = "true" ] && [ -n "${GPG_RECIPIENT}" ]; then
-        log_info "Szyfrowanie archiwum GPG dla odbiorcy: ${GPG_RECIPIENT}"
+        log_info "Szyfrowanie archiwum GPG dla odbiorcy: ${GPG_RECIPIENT}" >&2
         gpg --batch --yes --trust-model always -e -r "${GPG_RECIPIENT}" "${archive_path}"
         rm -f "${archive_path}"
         archive_path="${archive_path}.gpg"

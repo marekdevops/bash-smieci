@@ -179,6 +179,11 @@ main() {
             return 0
         fi
 
+        compress_uncompressed_files "${staging_dir}" || {
+            JOB_ERROR_MSG="Błąd kompresji plików"
+            exit 1
+        }
+
         if [ "${PACK_ARCHIVE:-true}" = "true" ]; then
             local archive_out="${WORK_DIR}/archive"
             mkdir -p "${archive_out}"
@@ -192,10 +197,6 @@ main() {
                 exit 1
             }
         else
-            compress_uncompressed_files "${staging_dir}" || {
-                JOB_ERROR_MSG="Błąd kompresji plików"
-                exit 1
-            }
             transfer_directory_mirror "${staging_dir}" "${REMOTE_DIR}" "${MANIFEST_FILE}" || {
                 JOB_ERROR_MSG="Błąd wysyłki plików z ${staging_dir}"
                 exit 1
